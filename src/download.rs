@@ -5,14 +5,20 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub fn fetch(url: &str, dir: &Path, expected: u64) -> Result<PathBuf, String> {
+/// `hint` is the size the plan recorded, used only to draw a percentage. It is NOT what the
+/// download is checked against: Geofabrik rebuilds every extract daily, so a plan made
+/// yesterday describes a file that no longer exists, and brazil arriving 344 KB larger than
+/// planned is the archive being fresh, not the download being wrong. Completeness is judged
+/// against the Content-Length of this very response.
+pub fn fetch(url: &str, dir: &Path, hint: u64, quiet: bool) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let name = url.rsplit('/').next().ok_or("bad url")?;
     let final_path = dir.join(name);
     let part = dir.join(format!("{name}.part"));
 
+    // Only a completed download ever wears the final name, so any non-empty file here is one.
     if let Ok(md) = std::fs::metadata(&final_path) {
-        if expected == 0 || md.len() == expected {
+        if md.len() > 0 {
             return Ok(final_path);
         }
         std::fs::remove_file(&final_path).map_err(|e| e.to_string())?;
@@ -28,6 +34,8 @@ pub fn fetch(url: &str, dir: &Path, expected: u64) -> Result<PathBuf, String> {
     if !resp.status().is_success() {
         return Err(format!("{} for {url}", resp.status()));
     }
+    let declared = resp.content_length();
+    let total = declared.unwrap_or(hint);
 
     let mut file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; 1 << 20];
@@ -40,9 +48,9 @@ pub fn fetch(url: &str, dir: &Path, expected: u64) -> Result<PathBuf, String> {
         }
         file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         done += n as u64;
-        if last_report.elapsed().as_secs() >= 5 {
-            let pct = if expected > 0 {
-                format!(" ({:.0}%)", 100.0 * done as f64 / expected as f64)
+        if !quiet && last_report.elapsed().as_secs() >= 5 {
+            let pct = if total > 0 {
+                format!(" ({:.0}%)", 100.0 * done as f64 / total as f64)
             } else {
                 String::new()
             };
@@ -53,11 +61,18 @@ pub fn fetch(url: &str, dir: &Path, expected: u64) -> Result<PathBuf, String> {
     }
     file.sync_all().map_err(|e| e.to_string())?;
     drop(file);
-    eprintln!("\r    downloaded {:.0} MB          ", done as f64 / 1e6);
+    if !quiet {
+        eprintln!("\r    downloaded {:.0} MB          ", done as f64 / 1e6);
+    }
 
-    if expected > 0 && done != expected {
-        let _ = std::fs::remove_file(&part);
-        return Err(format!("short download: got {done} of {expected} bytes"));
+    // A server that sent no Content-Length gives nothing to check against; a chunked transfer
+    // that ends early is indistinguishable from one that ends, and the bake would reject the
+    // truncated .pbf anyway.
+    if let Some(declared) = declared {
+        if done != declared {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!("short download: got {done} of {declared} bytes"));
+        }
     }
     std::fs::rename(&part, &final_path).map_err(|e| e.to_string())?;
     Ok(final_path)

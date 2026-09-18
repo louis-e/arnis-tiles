@@ -134,7 +134,7 @@ fn real_main() -> Result<(), String> {
                         // (a skip landed in between); that download still finished into the
                         // pbf dir, so it is simply not waited on here.
                         drop(other);
-                        download::fetch(&r.url, &pbf_dir, r.bytes)?
+                        download::fetch(&r.url, &pbf_dir, r.bytes, false)?
                     }
                 };
                 if let Some(next) = todo.get(i + 1) {
@@ -143,7 +143,7 @@ fn real_main() -> Result<(), String> {
                             (next.url.clone(), pbf_dir.clone(), next.bytes, next.id.clone());
                         prefetch = Some((
                             id,
-                            std::thread::spawn(move || download::fetch(&url, &dir, bytes)),
+                            std::thread::spawn(move || download::fetch(&url, &dir, bytes, true)),
                         ));
                     }
                 }

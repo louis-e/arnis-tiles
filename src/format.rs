@@ -5,14 +5,15 @@
 //! carry no OSM ids - the decoder mints them from the coordinate, which is what keeps the
 //! archive about a third the size of the equivalent .osm.pbf.
 //!
-//! Coordinates are stored in units of 1e-5 degrees (~1.1 m). Arnis places one block per
-//! metre, so that is below what it can render.
+//! Coordinates are stored in units of 1e-6 degrees (~0.11 m). Arnis places one block per metre,
+//! so this is an order of magnitude finer than the grid it snaps to: quantisation can no longer
+//! move a wall by a block, which 1e-5 (~1.1 m) occasionally could.
 
 use std::collections::HashMap;
 
 pub const MAGIC: &[u8; 4] = b"AOT1";
 /// Degrees per stored coordinate unit.
-pub const COORD_SCALE: f64 = 1e5;
+pub const COORD_SCALE: f64 = 1e6;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {

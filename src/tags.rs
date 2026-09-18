@@ -126,12 +126,17 @@ fn has_wanted_key(tags: &[(String, String)]) -> bool {
     tags.iter().any(|(k, _)| WANTED_KEYS.contains(&k.as_str()))
 }
 
+/// Any way that carries a tag at all.
+///
+/// Deliberately wider than WANTED_KEYS, because the Overpass query ends in a bare `way;` that
+/// pulls every way in the bbox - and Arnis does render from keys the query never names:
+/// `area:aeroway`, `service=siding`, `tomb=pyramid`, `ruins:building`. Enumerating those is a
+/// list that silently rots every time an element_processing branch gains a key, so the rule is
+/// "it has a tag we did not filter out". Untagged non-member ways are the only ways dropped,
+/// and they cannot render: the dispatch in data_processing.rs is an if/else-if chain over tag
+/// keys with no fallback branch.
 pub fn way_is_wanted(tags: &[(String, String)]) -> bool {
-    if excluded_by_value(tags) {
-        return false;
-    }
-    // `place` is way-only in the Overpass query: a place node is a label, not geometry.
-    has_wanted_key(tags) || get(tags, "place").is_some()
+    !excluded_by_value(tags) && !tags.is_empty()
 }
 
 pub fn node_is_wanted(tags: &[(String, String)]) -> bool {
@@ -188,6 +193,29 @@ mod tests {
     fn a_place_label_node_is_not_geometry() {
         assert!(way_is_wanted(&t(&[("place", "square")])));
         assert!(!node_is_wanted(&t(&[("place", "city")])));
+    }
+
+    // Keys Arnis dispatches on that the Overpass query never names - they reach it today only
+    // through the bare `way;`, so the archive has to carry them too.
+    #[test]
+    fn keeps_ways_whose_only_key_is_one_the_query_never_asks_for() {
+        for only in [
+            ("area:aeroway", "taxiway"),
+            ("service", "siding"),
+            ("tomb", "pyramid"),
+            ("ruins:building", "yes"),
+            ("disused:building", "yes"),
+            ("construction:building", "yes"),
+        ] {
+            assert!(way_is_wanted(&t(&[only])), "{} was dropped", only.0);
+        }
+    }
+
+    // The one thing dropped: a way with nothing left after the tag filter. It has no branch to
+    // land in downstream, so it renders nothing either way.
+    #[test]
+    fn drops_only_ways_with_no_usable_tag() {
+        assert!(!way_is_wanted(&[]));
     }
 
     // The tag filter must match osm_parser.rs, including its two deliberate exceptions.
