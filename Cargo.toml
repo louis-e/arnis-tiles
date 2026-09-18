@@ -1,0 +1,20 @@
+[package]
+name = "arnis-tiles"
+version = "0.1.0"
+edition = "2021"
+description = "Bakes OpenStreetMap planet data into the Arnis tile archive"
+license = "Apache-2.0"
+
+[dependencies]
+osmpbf = "0.3"
+zstd = "0.13"
+pmtiles = { version = "0.24", features = ["write"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+reqwest = { version = "0.13", features = ["blocking", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
