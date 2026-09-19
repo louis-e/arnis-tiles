@@ -45,13 +45,9 @@ enum Cmd {
         #[arg(long)]
         keep_pbf: bool,
     },
-    /// Merge each continent's chunk store into out/<continent>.pmtiles.
-    Finalize {
-        /// Keep the chunk stores. They are deleted by default: together they are the largest
-        /// thing on disk, and re-running `run` for that continent rebuilds one.
-        #[arg(long)]
-        keep_chunks: bool,
-    },
+    /// Publish any continent whose chunk store is still on disk. `run` already does this as
+    /// each continent completes; this is for finishing an interrupted run.
+    Finalize,
     /// Print what is in the chunk store.
     Status,
     /// Decode one tile out of the chunk store (debugging).
@@ -79,6 +75,60 @@ const MIN_FREE_BYTES: u64 = 15_000_000_000;
 
 fn plan_path(work: &Path) -> PathBuf {
     work.join("plan.json")
+}
+
+/// A continent already published. Its chunk store is gone, so `run` must not try to add to it.
+fn finalized_marker(work: &Path, continent: &str) -> PathBuf {
+    work.join(format!("{continent}.finalized"))
+}
+
+/// Publishes one continent and reclaims its chunk store.
+///
+/// Done as soon as a continent's last region is baked rather than at the very end, because all
+/// the stores together do not fit: the planet's chunks come to ~103 GB, and turning each
+/// continent into its (smaller) archive as it completes keeps peak disk near one store plus the
+/// archives written so far.
+fn publish_continent(work: &Path, out: &Path, zoom: u8, continent: &str) -> Result<(), String> {
+    let store_path = store::store_path(work, continent);
+    if !store_path.exists() {
+        return Ok(());
+    }
+    {
+        let st = store::ChunkStore::open(&store_path)?;
+        if let Some(entry) = finalize::one(&st, out, zoom, continent)? {
+            let manifest_path = work.join("manifest.json");
+            let mut manifest: Vec<finalize::ArchiveEntry> = std::fs::read(&manifest_path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            manifest.retain(|e| e.name != continent);
+            manifest.push(entry);
+            manifest.sort_by(|a, b| a.name.cmp(&b.name));
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let index = out.join("archives.json");
+            std::fs::write(
+                &index,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "zoom": zoom,
+                    "format": "AOT1+zstd",
+                    "attribution": "© OpenStreetMap contributors, ODbL 1.0",
+                    "archives": manifest,
+                }))
+                .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            println!("published {} and updated {}", continent, index.display());
+        }
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", store_path.display()));
+    }
+    std::fs::write(finalized_marker(work, continent), b"").map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn load_plan(work: &Path) -> Result<plan::Plan, String> {
@@ -126,11 +176,26 @@ fn real_main() -> Result<(), String> {
             let p = load_plan(&cli.work)?;
             let pbf_dir = cli.work.join("pbf");
             let mut stores: HashMap<String, store::ChunkStore> = HashMap::new();
-            let todo: Vec<&plan::Region> = p
+            // Grouped by continent, biggest continent first, so a continent completes and its
+            // store is reclaimed before the next one starts - and the largest store exists
+            // while the fewest archives are on disk.
+            let mut continent_bytes: HashMap<&str, u64> = HashMap::new();
+            for r in &p.regions {
+                *continent_bytes.entry(r.continent.as_str()).or_default() += r.bytes;
+            }
+            let mut todo: Vec<&plan::Region> = p
                 .regions
                 .iter()
                 .filter(|r| only.is_empty() || only.contains(&r.id))
+                .filter(|r| !finalized_marker(&cli.work, &r.continent).exists())
                 .collect();
+            todo.sort_by_key(|r| {
+                (
+                    std::cmp::Reverse(continent_bytes.get(r.continent.as_str()).copied().unwrap_or(0)),
+                    r.continent.clone(),
+                    std::cmp::Reverse(r.bytes),
+                )
+            });
             let total = todo.len();
             // The bake is CPU-bound and the download is not, so the next extract is fetched
             // while the current one bakes. Serially this run is download + bake; overlapped it
@@ -202,52 +267,29 @@ fn real_main() -> Result<(), String> {
                     s.bytes as f64 / 1e6,
                     t0.elapsed().as_secs_f64()
                 );
+
+                // Last region of this continent? Publish it now and give the disk back.
+                let more_here = todo
+                    .get(i + 1..)
+                    .is_some_and(|rest| rest.iter().any(|n| n.continent == r.continent));
+                if !more_here {
+                    stores.remove(&r.continent);
+                    publish_continent(&cli.work, &cli.out, p.zoom, &r.continent)?;
+                }
             }
             println!("run complete");
         }
 
-        Cmd::Finalize { keep_chunks } => {
+        Cmd::Finalize => {
             let p = load_plan(&cli.work)?;
             let mut continents: Vec<String> =
                 p.regions.iter().map(|r| r.continent.clone()).collect();
             continents.sort();
             continents.dedup();
 
-            let mut manifest: Vec<finalize::ArchiveEntry> = Vec::new();
             for continent in continents {
-                let path = store::store_path(&cli.work, &continent);
-                if !path.exists() {
-                    continue;
-                }
-                {
-                    let st = store::ChunkStore::open(&path)?;
-                    if let Some(entry) = finalize::one(&st, &cli.out, p.zoom, &continent)? {
-                        manifest.push(entry);
-                    }
-                }
-                if !keep_chunks {
-                    for suffix in ["", "-wal", "-shm"] {
-                        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-                    }
-                }
+                publish_continent(&cli.work, &cli.out, p.zoom, &continent)?;
             }
-
-            // The client reads this first and opens only the archives its bbox touches, so a
-            // bbox in Hamburg never pays a request to find out south-america does not have it.
-            manifest.sort_by(|a, b| a.name.cmp(&b.name));
-            let index = cli.out.join("archives.json");
-            std::fs::write(
-                &index,
-                serde_json::to_vec_pretty(&serde_json::json!({
-                    "zoom": p.zoom,
-                    "format": "AOT1+zstd",
-                    "attribution": "© OpenStreetMap contributors, ODbL 1.0",
-                    "archives": manifest,
-                }))
-                .map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-            println!("{} written", index.display());
         }
 
         Cmd::Status => {

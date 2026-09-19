@@ -7,7 +7,7 @@
 use crate::format::{self, Tile};
 use crate::store::ChunkStore;
 use pmtiles::{PmTilesWriter, TileCoord, TileType};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -15,7 +15,7 @@ use std::path::Path;
 const ZSTD_LEVEL: i32 = 19;
 
 /// One line of the archive directory a client reads before anything else.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ArchiveEntry {
     pub name: String,
     pub file: String,

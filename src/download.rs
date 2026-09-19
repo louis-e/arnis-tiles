@@ -10,7 +10,30 @@ use std::path::{Path, PathBuf};
 /// yesterday describes a file that no longer exists, and brazil arriving 344 KB larger than
 /// planned is the archive being fresh, not the download being wrong. Completeness is judged
 /// against the Content-Length of this very response.
+/// Attempts per extract. Over 305 downloads and several hours a transient failure is close to
+/// certain - one killed a run 31 regions in ("request or response body error") - and losing
+/// hours of baking to a blip is not a reasonable failure mode.
+const ATTEMPTS: u32 = 4;
+
 pub fn fetch(url: &str, dir: &Path, hint: u64, quiet: bool) -> Result<PathBuf, String> {
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        match fetch_once(url, dir, hint, quiet) {
+            Ok(p) => return Ok(p),
+            Err(e) => {
+                last = e;
+                if attempt < ATTEMPTS {
+                    let wait = 5 * (1 << (attempt - 1));
+                    eprintln!("    download failed ({last}); retrying in {wait}s");
+                    std::thread::sleep(std::time::Duration::from_secs(wait));
+                }
+            }
+        }
+    }
+    Err(format!("after {ATTEMPTS} attempts: {last}"))
+}
+
+fn fetch_once(url: &str, dir: &Path, hint: u64, quiet: bool) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let name = url.rsplit('/').next().ok_or("bad url")?;
     let final_path = dir.join(name);
