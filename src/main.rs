@@ -50,6 +50,10 @@ enum Cmd {
     Finalize,
     /// Print what is in the chunk store.
     Status,
+    /// Clear the bake state so the next `run` starts a fresh planet, keeping the plan and the
+    /// cached index. Without this a re-bake silently does nothing: finished continents are
+    /// marked and skipped.
+    Reset,
     /// Decode one tile out of the chunk store (debugging).
     Inspect { x: u32, y: u32 },
 }
@@ -218,10 +222,11 @@ fn real_main() -> Result<(), String> {
                     }
                 }
                 let st = stores.get_mut(&r.continent).expect("store just inserted");
-                if st.is_done(&r.id)? {
+                let already = st.is_done(&r.id)?;
+                if already {
                     println!("[{}/{total}] {} already baked, skipping", i + 1, r.id);
-                    continue;
                 }
+                if !already {
                 println!(
                     "[{}/{total}] {} ({:.0} MB)",
                     i + 1,
@@ -267,8 +272,12 @@ fn real_main() -> Result<(), String> {
                     s.bytes as f64 / 1e6,
                     t0.elapsed().as_secs_f64()
                 );
+                }
 
                 // Last region of this continent? Publish it now and give the disk back.
+                // Checked for skipped regions too: a continent whose regions were all baked by
+                // an earlier run would otherwise never be published at all, and its store would
+                // sit on disk with no archive to show for it.
                 let more_here = todo
                     .get(i + 1..)
                     .is_some_and(|rest| rest.iter().any(|n| n.continent == r.continent));
@@ -290,6 +299,24 @@ fn real_main() -> Result<(), String> {
             for continent in continents {
                 publish_continent(&cli.work, &cli.out, p.zoom, &continent)?;
             }
+        }
+
+        Cmd::Reset => {
+            let mut removed = 0;
+            for entry in std::fs::read_dir(&cli.work).map_err(|e| e.to_string())? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let stale = name.starts_with("chunks-")
+                    || name.ends_with(".finalized")
+                    || name == "manifest.json";
+                if stale {
+                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                    removed += 1;
+                }
+            }
+            let _ = std::fs::remove_dir_all(cli.work.join("pbf"));
+            println!("cleared {removed} state files; plan.json and cache/ kept");
+            println!("out/ is untouched - move or delete it before re-baking");
         }
 
         Cmd::Status => {
