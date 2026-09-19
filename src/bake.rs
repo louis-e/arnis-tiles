@@ -3,6 +3,10 @@
 //! Three streaming passes, so peak memory is one node-coordinate array rather than the whole
 //! extract: relations first (to learn which untagged ways are multipolygon members), then
 //! node coordinates, then ways. Nothing is held that a later pass can re-read.
+//!
+//! Finished tiles are flushed to the store as they accumulate rather than at the end. Holding a
+//! whole region's output was what made the united-kingdom extract take the process past 8 GB;
+//! a tile split across several flushes is merged at finalize like any other multi-writer tile.
 
 use crate::format::{self, Node, Relation, Tile, Way};
 use crate::store::ChunkStore;
@@ -19,6 +23,97 @@ fn q(v: f64) -> i32 {
 
 fn deg(v: i32) -> f64 {
     v as f64 / format::COORD_SCALE
+}
+
+/// Roughly what an element costs in RAM, used only to decide when to flush. A String carries
+/// its own allocation and header, so tags dominate and their length is what is counted.
+fn weigh(tags: &[(String, String)], points: usize) -> usize {
+    points * 8 + tags.iter().map(|(k, v)| k.len() + v.len() + 48).sum::<usize>() + 32
+}
+
+/// Accumulates tiles and spills them to the store on a memory budget.
+struct Sink<'a> {
+    tiles: HashMap<(u32, u32), Tile>,
+    weights: HashMap<(u32, u32), usize>,
+    pending: usize,
+    store: &'a mut ChunkStore,
+    region: &'a str,
+    bytes: u64,
+    rows: usize,
+}
+
+/// Flush threshold. Small enough that a dense extract stays well inside a laptop's memory,
+/// large enough that the store sees big transactions rather than a row at a time.
+const FLUSH_BYTES: usize = 192 * 1024 * 1024;
+
+impl Sink<'_> {
+    fn add(
+        &mut self,
+        tile: (u32, u32),
+        weight: usize,
+        f: impl FnOnce(&mut Tile),
+    ) -> Result<(), String> {
+        f(self.tiles.entry(tile).or_default());
+        *self.weights.entry(tile).or_default() += weight;
+        self.pending += weight;
+        if self.pending >= FLUSH_BYTES {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    /// Writes out the heaviest tiles until the budget is half free again, instead of draining
+    /// everything.
+    ///
+    /// Draining wrote every resident tile on every flush, which turned the united-kingdom into
+    /// 1.07M rows over 46k tiles: 23 slivers each, none of them big enough for zstd to find
+    /// anything, and a store barely smaller than the data in it. Evicting by weight means a
+    /// dense tile is split a few times and the long tail of quiet tiles is written exactly once.
+    fn spill(&mut self) -> Result<(), String> {
+        let target = FLUSH_BYTES / 2;
+        let mut by_weight: Vec<((u32, u32), usize)> =
+            self.weights.iter().map(|(k, v)| (*k, *v)).collect();
+        by_weight.sort_unstable_by_key(|(_, w)| std::cmp::Reverse(*w));
+
+        let mut victims: Vec<(u32, u32)> = Vec::new();
+        let mut freed = 0usize;
+        for (key, w) in by_weight {
+            if self.pending - freed <= target {
+                break;
+            }
+            freed += w;
+            victims.push(key);
+        }
+        self.write(&victims)?;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        let all: Vec<(u32, u32)> = self.tiles.keys().copied().collect();
+        self.write(&all)
+    }
+
+    fn write(&mut self, keys: &[(u32, u32)]) -> Result<(), String> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.store.begin()?;
+        for key in keys {
+            let Some(tile) = self.tiles.remove(key) else {
+                continue;
+            };
+            self.pending -= self.weights.remove(key).unwrap_or(0);
+            if tile.is_empty() {
+                continue;
+            }
+            let blob = format::encode(&tile);
+            self.bytes += blob.len() as u64;
+            self.rows += 1;
+            self.store.put(key.0, key.1, self.region, &blob)?;
+        }
+        self.store.commit()?;
+        Ok(())
+    }
 }
 
 pub struct Stats {
@@ -67,17 +162,35 @@ pub fn bake(pbf: &Path, store: &mut ChunkStore, region: &str, zoom: u8) -> Resul
         .map_err(|e| e.to_string())?;
 
     // ── pass 1: node coordinates (+ the tagged ones, which are POIs in their own right) ──
+    let mut sink = Sink {
+        tiles: HashMap::new(),
+        weights: HashMap::new(),
+        pending: 0,
+        store,
+        region,
+        bytes: 0,
+        rows: 0,
+    };
     let mut coords: Vec<(i64, i32, i32)> = Vec::new();
-    let mut pois: Vec<Node> = Vec::new();
+    let mut n_pois = 0u64;
+    let mut poi_err: Option<String> = None;
     let mut handle_node = |id: i64, lat: f64, lon: f64, t: Vec<(String, String)>| {
         coords.push((id, q(lat), q(lon)));
-        if tags::node_is_wanted(&t) {
-            pois.push(Node {
+        if poi_err.is_none() && tags::node_is_wanted(&t) {
+            n_pois += 1;
+            let node = Node {
                 id: id as u64,
                 lat: q(lat),
                 lon: q(lon),
                 tags: t,
-            });
+            };
+            let tl = tilemath::tile_of(lat, lon, zoom);
+            let w = weigh(&node.tags, 1);
+            // osmpbf's for_each hands back no Result, so an error is parked and raised once
+            // the pass ends rather than silently dropping the rest of the nodes.
+            if let Err(e) = sink.add(tl, w, |t| t.nodes.push(node)) {
+                poi_err = Some(e);
+            }
         }
     };
     open()?
@@ -101,6 +214,10 @@ pub fn bake(pbf: &Path, store: &mut ChunkStore, region: &str, zoom: u8) -> Resul
             _ => {}
         })
         .map_err(|e| e.to_string())?;
+    if let Some(e) = poi_err {
+        return Err(e);
+    }
+    sink.flush()?;
     coords.sort_unstable_by_key(|(id, _, _)| *id);
     let lookup = |id: i64| -> Option<(i32, i32)> {
         coords
@@ -110,9 +227,9 @@ pub fn bake(pbf: &Path, store: &mut ChunkStore, region: &str, zoom: u8) -> Resul
     };
 
     // ── pass 2: ways, emitted straight into their tiles ──────────────────────
-    let mut tiles: HashMap<(u32, u32), Tile> = HashMap::new();
     let mut way_tiles: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
     let mut n_ways = 0u64;
+    let mut way_err: Option<String> = None;
 
     open()?
         .for_each(|el| {
@@ -156,14 +273,22 @@ pub fn bake(pbf: &Path, store: &mut ChunkStore, region: &str, zoom: u8) -> Resul
                     touched.push(tl);
                 }
             }
+            if way_err.is_some() {
+                return;
+            }
             let way = Way {
                 id: w.id() as u64,
                 closed,
                 tags: t,
                 points,
             };
+            let weight = weigh(&way.tags, way.points.len());
             for tl in &touched {
-                tiles.entry(*tl).or_default().ways.push(way.clone());
+                let copy = way.clone();
+                if let Err(e) = sink.add(*tl, weight, |t| t.ways.push(copy)) {
+                    way_err = Some(e);
+                    return;
+                }
             }
             if is_member {
                 way_tiles.insert(way.id, touched);
@@ -172,12 +297,11 @@ pub fn bake(pbf: &Path, store: &mut ChunkStore, region: &str, zoom: u8) -> Resul
         })
         .map_err(|e| e.to_string())?;
 
-    // POIs land in their own tile.
-    let n_pois = pois.len() as u64;
-    for p in pois {
-        let tl = tilemath::tile_of(deg(p.lat), deg(p.lon), zoom);
-        tiles.entry(tl).or_default().nodes.push(p);
+    if let Some(e) = way_err {
+        return Err(e);
     }
+    // The coordinate table is the biggest thing here and nothing below needs it.
+    drop(coords);
 
     // A relation goes wherever its members went, so a tile that holds part of a multipolygon
     // also holds the relation that explains it.
@@ -197,30 +321,20 @@ pub fn bake(pbf: &Path, store: &mut ChunkStore, region: &str, zoom: u8) -> Resul
             continue;
         }
         n_rels += 1;
+        let weight = weigh(&r.tags, r.members.len());
         for t in where_to {
-            tiles.entry(t).or_default().relations.push(r.clone());
+            let copy = r.clone();
+            sink.add(t, weight, |tile| tile.relations.push(copy))?;
         }
     }
 
-    // ── write ────────────────────────────────────────────────────────────────
-    let mut bytes = 0u64;
-    let n_tiles = tiles.len();
-    store.begin()?;
-    for ((x, y), tile) in tiles {
-        if tile.is_empty() {
-            continue;
-        }
-        let blob = format::encode(&tile);
-        bytes += blob.len() as u64;
-        store.put(x, y, region, &blob)?;
-    }
-    store.commit()?;
+    sink.flush()?;
 
     Ok(Stats {
         nodes: n_pois,
         ways: n_ways,
         relations: n_rels,
-        tiles: n_tiles,
-        bytes,
+        tiles: sink.rows,
+        bytes: sink.bytes,
     })
 }

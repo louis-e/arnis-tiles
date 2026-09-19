@@ -1,11 +1,24 @@
-//! The chunk store: one row per (tile, contributing region).
+//! The chunk store: rows of (tile, contributing region, a slice of that tile's elements).
 //!
-//! Extracts overlap at their borders, so a tile can be written by more than one of them.
-//! Rows are kept separate during the bake and merged once, at finalize, where duplicate
-//! elements are dropped by OSM id - cheaper and far simpler than merging mid-bake.
+//! Extracts overlap at their borders and a big region is flushed in pieces to bound memory, so
+//! a tile accumulates several rows. They are merged once, at finalize, where duplicate elements
+//! are dropped by OSM id - cheaper and far simpler than merging mid-bake.
+//!
+//! One store per continent, not one for the planet: finalize can then publish a continent and
+//! reclaim its store immediately, which is what keeps peak disk near 70 GB instead of 135.
+//! Blobs are zstd'd on the way in for the same reason - the store is the biggest thing on disk
+//! during a run, and it is written once and read once.
 
 use rusqlite::Connection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Fast level: this data is read once, by finalize, which re-compresses at 19 for publication.
+const CHUNK_ZSTD_LEVEL: i32 = 3;
+
+/// One store per continent, named so `finalize` can find them by globbing.
+pub fn store_path(work: &Path, continent: &str) -> PathBuf {
+    work.join(format!("chunks-{continent}.db"))
+}
 
 pub struct ChunkStore {
     conn: Connection,
@@ -56,13 +69,19 @@ impl ChunkStore {
     }
 
     pub fn put(&self, x: u32, y: u32, region: &str, data: &[u8]) -> Result<(), String> {
+        let packed = zstd::encode_all(data, CHUNK_ZSTD_LEVEL).map_err(|e| e.to_string())?;
         self.conn
             .execute(
                 "INSERT INTO chunk(x,y,region,data) VALUES (?1,?2,?3,?4)",
-                rusqlite::params![x, y, region, data],
+                rusqlite::params![x, y, region, packed],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    /// Undoes [`put`]'s compression. Kept next to it so the two cannot drift.
+    pub fn unpack(blob: &[u8]) -> Result<Vec<u8>, String> {
+        zstd::decode_all(blob).map_err(|e| e.to_string())
     }
 
     pub fn is_done(&self, region: &str) -> Result<bool, String> {
