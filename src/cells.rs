@@ -137,7 +137,7 @@ pub fn scan_archive(path: &Path, zoom: u8) -> Result<Vec<u32>, String> {
     };
 
     let mut cells = BTreeSet::new();
-    let mut note = |id: u64, run: u64, cells: &mut BTreeSet<u32>| {
+    let note = |id: u64, run: u64, cells: &mut BTreeSet<u32>| {
         for k in 0..run.min(1 << 20) {
             let (x, y) = tile_xy(zoom, id + k);
             cells.insert(cell_of(x, y, zoom));
