@@ -421,6 +421,9 @@ fn real_main() -> Result<(), String> {
                 let found = cells::scan_archive(&path, tilemath::ZOOM)?;
                 println!("{:24} {} cells", entry.name, found.len());
                 entry.cells = found;
+                if let Ok(md) = std::fs::metadata(&path) {
+                    entry.bytes = md.len();
+                }
                 if entry.built.is_empty() {
                     if let Ok(secs) = std::fs::metadata(&path).and_then(|m| {
                         m.modified()?

@@ -1,7 +1,7 @@
 # arnis-tiles
 
-Bakes the OpenStreetMap planet into the **Arnis tile archive**: a set of PMTiles files on static
-hosting that [Arnis](https://github.com/louis-e/arnis) reads over HTTP range requests, instead of
+Bakes the OpenStreetMap planet into the Arnis tile archive: a set of PMTiles files on static
+hosting that [Arnis](https://github.com/louis-e/arnis) reads over HTTP range requests instead of
 querying a public Overpass API.
 
 One archive per continent, one z13 tile per ~4.9 km square, one zstd-compressed `AOT1` payload
@@ -10,105 +10,103 @@ per tile. A city-sized generation reads a few hundred kilobytes and touches no O
 ## Why
 
 Arnis was banned from `overpass-api.de` for using more than its share
-([#1347](https://github.com/louis-e/arnis/issues/1347)). Their recommendation was to bake planet
-dumps into a format that serves our users. This is that.
+([#1347](https://github.com/louis-e/arnis/issues/1347)). The suggestion from the Overpass side
+was to bake planet dumps into something that serves our users directly. This is that.
 
-Measured against the Overpass path, same bbox in Andorra:
+Same bbox in Andorra (`42.500,1.510,42.515,1.535`), measured on the published archive:
 
 | | Overpass | tile archive |
 |---|---|---|
-| OSM fetch | 10.0 s | **0.046 s** |
-| bytes | 14.9 MB (a comparable Hamburg bbox) | 0.2 MB |
-| generated world | 20 regions, 84,107,264 bytes | 20 regions, 84,164,608 bytes |
+| OSM fetch | 1.74 MB over the wire | 0.29 MB, one tile |
+| requests | 1 | 2 for the index, then 1 per tile |
+| generated world | 20 regions, 86,503,424 bytes | 20 regions, 86,470,656 bytes |
 
-The 0.07% difference is the ~1.1 m coordinate quantisation and the untagged non-member ways the
-archive drops.
+The two worlds differ by 0.04%. Arnis is not bit-deterministic between runs (identical inputs
+drift by a few kilobytes, roughly 0.005%), so most of that gap is the ~0.11 m coordinate
+quantisation, not missing data.
 
 ## What is in a tile
 
 Everything Arnis renders from, and nothing else:
 
-* ways whose tags match the key list in `src/tags.rs` (which mirrors the Overpass query in
-  `retrieve_data.rs`), with geometry inlined
+* every tagged way, minus the values Arnis explicitly discards (see `src/tags.rs`), with its
+  geometry inlined
 * ways that are members of a kept relation, tagged or not
-* nodes carrying one of those keys (POIs - benches, waste baskets, entrances)
-* relations with those keys or `type=multipolygon` / `type=building`
-* every tag on them except what `osm_parser.rs` already discards (names, `addr:*` bar the house
-  number, wikipedia, operator, website, opening hours, source)
+* nodes carrying a rendered key (benches, waste baskets, entrances and so on)
+* relations with those keys, or `type=multipolygon` / `type=building`
+* every tag on them except what `osm_parser.rs` already throws away (names, `addr:*` except the
+  house number, wikipedia, operator, website, opening hours, source)
 
-So `building:levels`, `height`, `roof:shape`, `roof:material`, `building:colour` and
-`start_date` are all there.
+So `building:levels`, `height`, `roof:shape`, `roof:material`, `building:colour` and `start_date`
+all survive. The way filter is deliberately "anything tagged" rather than a key list, because a
+key list kept silently dropping tags that Arnis renders through less obvious paths
+(`area:aeroway`, `service=siding`, `ruins:building` and others).
 
-**Not** in a tile: OSM node ids for way vertices (the decoder mints them from the coordinate -
-this is most of the size saving), element metadata (version, timestamp, changeset, user - which
-Geofabrik strips anyway), coastline/ocean/tidal features (Arnis resolves those from satellite
-land cover), and coordinate precision below ~1.1 m.
+Not in a tile: OSM node ids for way vertices (the decoder mints them from the coordinate, and
+this is most of the size saving), element metadata such as version, timestamp, changeset and user
+(Geofabrik strips those anyway), coastline and ocean features (Arnis resolves those from
+satellite land cover), and coordinate precision finer than ~0.11 m.
 
 ## Requirements
 
 * Rust stable
-* **~90 GB free disk** at peak, **~8 GB free RAM** (the largest planned extract is ~2.3 GB and
-  its node table dominates)
-* a connection you are happy to pull ~86 GB over
+* about 120 GB free disk at peak. `out/` ends up around 74 GB and the chunk store for the
+  continent being baked sits alongside it
+* about 8 GB free RAM. The largest planned extract is 2.26 GB and its node table dominates
+* a connection you are happy to pull 86 GB over
 
 ## Running a full bake
 
 ```sh
 cargo build --release
 
-# 1. Decide which extracts cover the world. Writes work/plan.json.
-#    First run HEADs all 555 Geofabrik extracts for their sizes and range-reads the headers of
-#    the handful with no cutting polygon; both are cached under cache/.
+# 1. Work out which extracts cover the world. Writes work/plan.json.
+#    The first run HEADs all 555 Geofabrik extracts for their sizes and range-reads the headers
+#    of the few with no cutting polygon. Both are cached under cache/.
 ./target/release/arnis-tiles plan
 
-# 2. Download, bake and delete each extract in turn. Resumable - rerun after any interruption
-#    and it skips what is already in the store.
+# 2. Download, bake and delete each extract in turn. Resumable: rerun after any interruption
+#    and it skips whatever is already in the store.
 ./target/release/arnis-tiles run
 
-# 3. Merge into out/<continent>.pmtiles + out/archives.json
+# 3. Merge into out/<continent>-<date>.pmtiles and out/archives.json.
+#    `run` already does this per continent as it finishes; this finishes an interrupted run.
 ./target/release/arnis-tiles finalize
 ```
 
-Expect roughly:
+The published planet is 305 extracts, 86 GB downloaded, 9,149,800 tiles, 74 GB in `out/`. Wall
+clock is dominated by bandwidth rather than CPU; budget the better part of a day on a laptop.
+Peak disk stays near one chunk store plus the archives written so far, because each continent is
+published and its store deleted as soon as its last region is baked.
 
-| | |
-|---|---|
-| extracts | ~305, ~86 GB downloaded |
-| CPU | ~2 h (single-threaded; downloads overlap with baking) |
-| wall clock | ~2–4 h depending on bandwidth |
-| `work/chunks.db` | ~45 GB, deletable after `finalize` |
-| `out/` | ~30–40 GB, this is what you publish |
-
-Check on it any time with `arnis-tiles status`, and look inside a single tile with
-`arnis-tiles inspect <x> <y>`.
+Check on it with `arnis-tiles status`, and look inside a single tile with `arnis-tiles inspect
+<x> <y>`.
 
 ### A partial bake is useful
 
-`run --only europe-ish-region-ids` bakes a subset, and `finalize` publishes whatever is in the
-store. Arnis falls back to Overpass for any tile the archive does not have, so you can ship one
-continent at a time rather than waiting for the planet.
+`run --only <region ids>` bakes a subset and `finalize` publishes whatever is in the store. Arnis
+falls back to Overpass for anything the archive does not have, so shipping one continent at a
+time is fine.
 
 ## Publishing to Cloudflare R2
 
-R2 is Cloudflare's S3-compatible object storage. It is the right host here because **egress is
-free** - the archive is served to every Arnis user at no bandwidth cost.
+R2 is Cloudflare's S3-compatible object storage, and it is the right host here because egress is
+free. The archive is served to every Arnis user at no bandwidth cost.
 
-**Cost at this size:** ~35 GB storage is **$0.38/month** (first 10 GB free, then $0.015/GB).
-Uploading the archive is a few thousand multipart PUTs, well under a dollar. User reads land in
-Class B ops, whose free tier is 10M/month - far more than Arnis generates. Budget **under
-$1/month**.
+At 74 GB, storage is about $0.97/month (first 10 GB free, then $0.015/GB). Uploading is a few
+thousand multipart PUTs, well under a dollar. Reads land in Class B operations, whose free tier
+is 10M/month, far more than Arnis generates.
 
 ### One-time setup
 
-1. Sign up at <https://dash.cloudflare.com> (a free account is enough; R2 asks for a card but
-   the free tier covers this).
-2. **R2 → Create bucket**, name it `arnis-tiles`, pick a location hint near your users.
-3. **R2 → Manage API tokens → Create API token**, scope *Object Read & Write* on that bucket.
-   Note the Access Key ID, Secret Access Key, and your Account ID.
+1. Sign up at <https://dash.cloudflare.com>. A free account is enough.
+2. R2 > Create bucket, name it `arnis-tiles`, pick a location hint near your users.
+3. R2 > Manage API tokens > Create API token, scoped Object Read & Write on that bucket. Note the
+   Access Key ID, Secret Access Key and your Account ID.
 
 ### Upload
 
-`rclone` handles multipart and resume; `aws s3` works too.
+`rclone` handles multipart and resume. `aws s3` works too.
 
 ```sh
 # ~/.config/rclone/rclone.conf
@@ -120,64 +118,76 @@ secret_access_key = <secret>
 endpoint = https://<account id>.r2.cloudflarestorage.com
 acl = private
 
-# upload, then verify
-rclone copy out/ r2:arnis-tiles/v1/ --progress --transfers 4
-rclone ls r2:arnis-tiles/v1/
+rclone copy out/ r2:arnis-tiles/v1/ --progress --transfers 4 --s3-no-check-bucket
+rclone check out/ r2:arnis-tiles/v1/ --size-only --s3-no-check-bucket
 ```
 
-Publish under a version prefix (`v1/`, or a date) so a re-bake can be uploaded and switched to
-atomically instead of overwriting the archive users are reading mid-generation.
+`--s3-no-check-bucket` matters: a scoped token cannot call CreateBucket, and rclone tries to by
+default.
+
+The `v1/` prefix is the format version, not the build. Bump it only when the tile format changes
+in a way older clients cannot read, because clients have the old prefix compiled in.
 
 ### Serving it
 
-**R2 → your bucket → Settings → Public access → Custom domain**, and point e.g.
-`osm.arnismc.com` at it. Cloudflare then serves the archive through its CDN, and the usual
-Cloudflare controls apply: cache rules, rate limiting, WAF, per-URL analytics. Egress stays free.
+R2 > your bucket > Settings > Public access > Custom domain, pointed at a hostname you control.
+Cloudflare then serves the archive through its CDN and the usual controls apply: cache rules,
+rate limiting, WAF, per-URL analytics. Egress stays free.
 
-Avoid the `r2.dev` managed subdomain for production - it is deliberately rate limited.
+Two rules worth setting:
+
+* `.pmtiles` requests: bypass cache. Cloudflare will not cache objects above 512 MB on Free, Pro
+  or Business, and every archive here is far larger, so marking them cacheable achieves nothing
+  and risks a cache fill answering a range request with the whole file.
+* `archives.json`: cacheable, with a short edge TTL. It is the only file that changes, so its TTL
+  decides how quickly a refresh reaches users.
+
+Avoid the `r2.dev` managed subdomain for production. It is deliberately rate limited.
 
 Then point Arnis at it:
 
 ```sh
-arnis --osm-tiles-url https://osm.arnismc.com/v1 --bbox "42.500,1.510,42.515,1.535" ...
+arnis --osm-tiles-url https://<your host>/v1 --bbox "42.500,1.510,42.515,1.535" ...
 ```
 
-Arnis fetches `archives.json` from that base URL (cached for a day), opens only the archives
-whose bounds overlap the bbox, and falls back to Overpass on any error.
+Arnis fetches `archives.json` from that base URL and caches it for a day, opens only the archives
+whose coverage cells intersect the bbox, and falls back to Overpass on any error.
 
 ## Keeping it fresh
 
-A tile is as fresh as the extract it was baked from - Geofabrik rebuilds daily, so a weekly
-re-bake keeps the archive within a week of live OSM. Re-run `plan` (the size cache expires
-naturally when you delete `cache/sizes.json`), then `run` against an empty `work/chunks.db`, then
-`finalize`.
+A tile is only as fresh as the extract it came from. Geofabrik rebuilds daily, so a weekly
+re-bake keeps the archive within a week of live OSM. Delete `cache/sizes.json` so `plan` re-reads
+sizes, then `run` against an empty chunk store, then `finalize`.
 
 Published archives carry the date they were built (`europe-20260921.pmtiles`) and are never
 overwritten, so `archives.json` is the only file that changes. That is what makes a refresh safe
 to publish in place: clients key their range cache on the filename, so a new bake invalidates it
-by itself and no Arnis release is needed. Upload the new archives first and `archives.json` last,
-then purge it from the CDN cache - until that purge the edge keeps serving the old index, which
-is harmless but means nobody sees the new data.
+by itself and no Arnis release is needed.
 
-Clients cache the index for 24h, so leave the superseded archive in place for a day before
+Upload the new archives first and `archives.json` last, then purge it from the CDN cache. Until
+that purge the edge keeps serving the old index, which is harmless but means nobody sees the new
+data.
+
+Clients cache the index for a day, so leave the superseded archive in place for 24 hours before
 deleting it. `finalize` prints which file that is.
 
 A re-bake writes coverage cells itself. Only an archive built before cells existed needs
-`arnis-tiles cells`, which rescans the files in `out/` (directories only, a second or so) and
-writes them into the index.
+`arnis-tiles cells`, which rescans the files in `out/` (directories only, about a second for the
+planet) and writes cells and on-disk sizes into the index.
 
 ## Testing locally without uploading
 
-PMTiles needs HTTP range requests, which `python3 -m http.server` does not implement. Any range
-capable static server works; the repo's `out/` can be served with one of the many one-file range
-servers, then:
+PMTiles needs HTTP range requests, which `python3 -m http.server` does not implement. Any
+range-capable static server works:
 
 ```sh
-arnis --osm-tiles-url http://127.0.0.1:8787 --bbox "..." --output-dir /tmp/w
+arnis --osm-tiles-url http://127.0.0.1:8787/v1 --bbox "..." --output-dir /tmp/w
 ```
 
 ## Licence
 
-The tool is Apache-2.0. **The archives it produces are a derivative database of OpenStreetMap
-and must be published under ODbL 1.0 with attribution to "© OpenStreetMap contributors".** Put
-that in `archives.json`'s neighbourhood and in whatever UI surfaces the data.
+The tool is Apache-2.0.
+
+The archives it produces are a derivative database of OpenStreetMap and must be published under
+ODbL 1.0 with attribution to "© OpenStreetMap contributors". `archives.json` carries that
+attribution; keep it there, and surface it in whatever UI shows the data.

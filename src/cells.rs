@@ -95,7 +95,9 @@ fn decode_dir(buf: &[u8]) -> Result<Vec<(u64, u64, u64, u64)>, String> {
             v - 1
         });
     }
-    Ok((0..n).map(|i| (ids[i], runs[i], lens[i], offs[i])).collect())
+    Ok((0..n)
+        .map(|i| (ids[i], runs[i], lens[i], offs[i]))
+        .collect())
 }
 
 fn inflate(kind: u8, raw: &[u8]) -> Result<Vec<u8>, String> {
