@@ -169,7 +169,10 @@ pub fn one(
         file: format!("{continent}-{built}.pmtiles"),
         built,
         tiles: n,
-        bytes: comp_total,
+        // On disk, not the sum of the tiles: the writer stores identical tiles once.
+        bytes: std::fs::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(comp_total),
         min_lat: extent.1,
         min_lon: extent.0,
         max_lat: extent.3,
