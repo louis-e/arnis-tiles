@@ -126,7 +126,11 @@ fn header_bbox(url: &str) -> Option<(f64, f64, f64, f64)> {
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .ok()?;
-    let resp = client.get(url).header("Range", "bytes=0-65535").send().ok()?;
+    let resp = client
+        .get(url)
+        .header("Range", "bytes=0-65535")
+        .send()
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -271,7 +275,10 @@ pub fn build(cache: &Path, zoom: u8) -> Result<Plan, String> {
             .iter()
             .filter(|(f, _)| rings(&f.geometry).is_empty())
             .collect();
-        eprintln!("{} extracts have no cutting polygon; reading their .pbf headers", missing.len());
+        eprintln!(
+            "{} extracts have no cutting polygon; reading their .pbf headers",
+            missing.len()
+        );
         let mut map: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
         for (f, url) in missing {
             match header_bbox(url) {
@@ -279,7 +286,10 @@ pub fn build(cache: &Path, zoom: u8) -> Result<Plan, String> {
                     eprintln!("  {} -> {:?}", f.properties.id, b);
                     map.insert(f.properties.id.clone(), b);
                 }
-                None => eprintln!("  {} -> NO HEADER BBOX (will be left to the Overpass fallback)", f.properties.id),
+                None => eprintln!(
+                    "  {} -> NO HEADER BBOX (will be left to the Overpass fallback)",
+                    f.properties.id
+                ),
             }
         }
         serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())

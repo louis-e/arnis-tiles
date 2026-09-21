@@ -50,10 +50,13 @@ enum Cmd {
     Finalize,
     /// Print what is in the chunk store.
     Status,
-    /// Clear the bake state so the next `run` starts a fresh planet, keeping the plan and the
-    /// cached index. Without this a re-bake silently does nothing: finished continents are
-    /// marked and skipped.
-    Reset,
+    /// Clear the bake state so the next `run` re-bakes, keeping the plan and the cached index.
+    /// Without this a re-bake silently does nothing: finished continents are marked and skipped.
+    Reset {
+        /// Only this continent, so one archive can be refreshed without re-baking the planet.
+        #[arg(long)]
+        continent: Option<String>,
+    },
     /// Decode one tile out of the chunk store (debugging).
     Inspect { x: u32, y: u32 },
 }
@@ -105,6 +108,10 @@ fn publish_continent(work: &Path, out: &Path, zoom: u8, continent: &str) -> Resu
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
+            let superseded = manifest
+                .iter()
+                .find(|e| e.name == continent && e.file != entry.file)
+                .map(|e| e.file.clone());
             manifest.retain(|e| e.name != continent);
             manifest.push(entry);
             manifest.sort_by(|a, b| a.name.cmp(&b.name));
@@ -126,6 +133,11 @@ fn publish_continent(work: &Path, out: &Path, zoom: u8, continent: &str) -> Resu
             )
             .map_err(|e| e.to_string())?;
             println!("published {} and updated {}", continent, index.display());
+            // Kept, not deleted: clients cache the index for 24h, so the previous archive has
+            // to stay reachable until they have all seen the new one.
+            if let Some(old) = superseded {
+                println!("  superseded {old} - remove from out/ and R2 after 24h");
+            }
         }
     }
     for suffix in ["", "-wal", "-shm"] {
@@ -195,7 +207,12 @@ fn real_main() -> Result<(), String> {
                 .collect();
             todo.sort_by_key(|r| {
                 (
-                    std::cmp::Reverse(continent_bytes.get(r.continent.as_str()).copied().unwrap_or(0)),
+                    std::cmp::Reverse(
+                        continent_bytes
+                            .get(r.continent.as_str())
+                            .copied()
+                            .unwrap_or(0),
+                    ),
                     r.continent.clone(),
                     std::cmp::Reverse(r.bytes),
                 )
@@ -204,7 +221,8 @@ fn real_main() -> Result<(), String> {
             // The bake is CPU-bound and the download is not, so the next extract is fetched
             // while the current one bakes. Serially this run is download + bake; overlapped it
             // is roughly the slower of the two.
-            let mut prefetch: Option<(String, std::thread::JoinHandle<Result<PathBuf, String>>)> = None;
+            let mut prefetch: Option<(String, std::thread::JoinHandle<Result<PathBuf, String>>)> =
+                None;
             for (i, r) in todo.iter().enumerate() {
                 if !stores.contains_key(&r.continent) {
                     let path = store::store_path(&cli.work, &r.continent);
@@ -227,51 +245,57 @@ fn real_main() -> Result<(), String> {
                     println!("[{}/{total}] {} already baked, skipping", i + 1, r.id);
                 }
                 if !already {
-                println!(
-                    "[{}/{total}] {} ({:.0} MB)",
-                    i + 1,
-                    r.id,
-                    r.bytes as f64 / 1e6
-                );
-                // A previous crash may have left half of this region in the store.
-                st.clear_region(&r.id)?;
-                let path = match prefetch.take() {
-                    Some((id, handle)) if id == r.id => {
-                        handle.join().map_err(|_| "download thread panicked")??
+                    println!(
+                        "[{}/{total}] {} ({:.0} MB)",
+                        i + 1,
+                        r.id,
+                        r.bytes as f64 / 1e6
+                    );
+                    // A previous crash may have left half of this region in the store.
+                    st.clear_region(&r.id)?;
+                    let path = match prefetch.take() {
+                        Some((id, handle)) if id == r.id => {
+                            handle.join().map_err(|_| "download thread panicked")??
+                        }
+                        other => {
+                            // Either nothing was queued yet, or the queued one is not this region
+                            // (a skip landed in between); that download still finished into the
+                            // pbf dir, so it is simply not waited on here.
+                            drop(other);
+                            download::fetch(&r.url, &pbf_dir, r.bytes, false)?
+                        }
+                    };
+                    if let Some(next) = todo.get(i + 1) {
+                        if !st.is_done(&next.id)? {
+                            let (url, dir, bytes, id) = (
+                                next.url.clone(),
+                                pbf_dir.clone(),
+                                next.bytes,
+                                next.id.clone(),
+                            );
+                            prefetch = Some((
+                                id,
+                                std::thread::spawn(move || {
+                                    download::fetch(&url, &dir, bytes, true)
+                                }),
+                            ));
+                        }
                     }
-                    other => {
-                        // Either nothing was queued yet, or the queued one is not this region
-                        // (a skip landed in between); that download still finished into the
-                        // pbf dir, so it is simply not waited on here.
-                        drop(other);
-                        download::fetch(&r.url, &pbf_dir, r.bytes, false)?
+                    let t0 = std::time::Instant::now();
+                    let s = bake::bake(&path, st, &r.id, p.zoom)?;
+                    st.mark_done(&r.id, s.bytes, s.tiles)?;
+                    if !keep_pbf {
+                        let _ = std::fs::remove_file(&path);
                     }
-                };
-                if let Some(next) = todo.get(i + 1) {
-                    if !st.is_done(&next.id)? {
-                        let (url, dir, bytes, id) =
-                            (next.url.clone(), pbf_dir.clone(), next.bytes, next.id.clone());
-                        prefetch = Some((
-                            id,
-                            std::thread::spawn(move || download::fetch(&url, &dir, bytes, true)),
-                        ));
-                    }
-                }
-                let t0 = std::time::Instant::now();
-                let s = bake::bake(&path, st, &r.id, p.zoom)?;
-                st.mark_done(&r.id, s.bytes, s.tiles)?;
-                if !keep_pbf {
-                    let _ = std::fs::remove_file(&path);
-                }
-                println!(
-                    "    {} ways, {} pois, {} relations -> {} tiles, {:.0} MB in {:.0}s",
-                    s.ways,
-                    s.nodes,
-                    s.relations,
-                    s.tiles,
-                    s.bytes as f64 / 1e6,
-                    t0.elapsed().as_secs_f64()
-                );
+                    println!(
+                        "    {} ways, {} pois, {} relations -> {} tiles, {:.0} MB in {:.0}s",
+                        s.ways,
+                        s.nodes,
+                        s.relations,
+                        s.tiles,
+                        s.bytes as f64 / 1e6,
+                        t0.elapsed().as_secs_f64()
+                    );
                 }
 
                 // Last region of this continent? Publish it now and give the disk back.
@@ -301,22 +325,34 @@ fn real_main() -> Result<(), String> {
             }
         }
 
-        Cmd::Reset => {
+        Cmd::Reset { continent } => {
             let mut removed = 0;
             for entry in std::fs::read_dir(&cli.work).map_err(|e| e.to_string())? {
                 let path = entry.map_err(|e| e.to_string())?.path();
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let stale = name.starts_with("chunks-")
-                    || name.ends_with(".finalized")
-                    || name == "manifest.json";
+                let stale = match &continent {
+                    // manifest.json is left alone for a single continent: it still describes the
+                    // other archives, and publishing this one rewrites only its own entry.
+                    Some(c) => name == format!("chunks-{c}.db") || name == format!("{c}.finalized"),
+                    None => {
+                        name.starts_with("chunks-")
+                            || name.ends_with(".finalized")
+                            || name == "manifest.json"
+                    }
+                };
                 if stale {
                     std::fs::remove_file(&path).map_err(|e| e.to_string())?;
                     removed += 1;
                 }
             }
             let _ = std::fs::remove_dir_all(cli.work.join("pbf"));
-            println!("cleared {removed} state files; plan.json and cache/ kept");
-            println!("out/ is untouched - move or delete it before re-baking");
+            match &continent {
+                Some(c) => println!("cleared {removed} state files for {c}; `run` will re-bake it"),
+                None => {
+                    println!("cleared {removed} state files; plan.json and cache/ kept");
+                    println!("out/ is untouched - move or delete it before re-baking");
+                }
+            }
         }
 
         Cmd::Status => {

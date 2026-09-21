@@ -28,7 +28,12 @@ fn deg(v: i32) -> f64 {
 /// Roughly what an element costs in RAM, used only to decide when to flush. A String carries
 /// its own allocation and header, so tags dominate and their length is what is counted.
 fn weigh(tags: &[(String, String)], points: usize) -> usize {
-    points * 8 + tags.iter().map(|(k, v)| k.len() + v.len() + 48).sum::<usize>() + 32
+    points * 8
+        + tags
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 48)
+            .sum::<usize>()
+        + 32
 }
 
 /// Accumulates tiles and spills them to the store on a memory budget.

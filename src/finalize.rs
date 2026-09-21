@@ -14,11 +14,32 @@ use std::path::Path;
 /// zstd level for published tiles. 19 costs bake time once and saves every download forever.
 const ZSTD_LEVEL: i32 = 19;
 
+/// UTC date as YYYYMMDD, via Howard Hinnant's civil-from-days.
+fn build_date() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}{m:02}{d:02}")
+}
+
 /// One line of the archive directory a client reads before anything else.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ArchiveEntry {
     pub name: String,
+    /// Dated, so every published archive is immutable: a re-bake lands beside the old file
+    /// instead of overwriting it, which is what lets clients cache byte ranges safely.
     pub file: String,
+    pub built: String,
     pub tiles: u64,
     pub bytes: u64,
     pub min_lat: f64,
@@ -98,7 +119,8 @@ pub fn one(
         .collect();
     with_id.sort_unstable_by_key(|(id, _, _)| *id);
 
-    let path = out_dir.join(format!("{continent}.pmtiles"));
+    let built = build_date();
+    let path = out_dir.join(format!("{continent}-{built}.pmtiles"));
     let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
     let mut writer = PmTilesWriter::new(TileType::Unknown)
         .min_zoom(zoom)
@@ -128,7 +150,10 @@ pub fn one(
         writer.add_tile(coord, &packed).map_err(|e| e.to_string())?;
         n += 1;
         if n % 50_000 == 0 {
-            eprintln!("  {continent}: {n} tiles, {:.1} GB", comp_total as f64 / 1e9);
+            eprintln!(
+                "  {continent}: {n} tiles, {:.1} GB",
+                comp_total as f64 / 1e9
+            );
         }
     }
     writer.finalize().map_err(|e| e.to_string())?;
@@ -141,7 +166,8 @@ pub fn one(
 
     Ok(Some(ArchiveEntry {
         name: continent.to_string(),
-        file: format!("{continent}.pmtiles"),
+        file: format!("{continent}-{built}.pmtiles"),
+        built,
         tiles: n,
         bytes: comp_total,
         min_lat: extent.1,
