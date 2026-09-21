@@ -4,6 +4,7 @@
 //! whole planet needs tens of gigabytes of disk rather than hundreds.
 
 mod bake;
+mod cells;
 mod download;
 mod finalize;
 mod format;
@@ -59,6 +60,9 @@ enum Cmd {
     },
     /// Decode one tile out of the chunk store (debugging).
     Inspect { x: u32, y: u32 },
+    /// Backfill coverage cells into the index by scanning the published archives in out/.
+    /// Only needed for archives baked before cells existed; `run` writes them itself.
+    Cells,
 }
 
 /// Free bytes on the filesystem holding `path`, or None if it cannot be read.
@@ -89,6 +93,34 @@ fn finalized_marker(work: &Path, continent: &str) -> PathBuf {
     work.join(format!("{continent}.finalized"))
 }
 
+/// Writes work/manifest.json and the published archives.json, returning the index path.
+fn write_index(
+    work: &Path,
+    out: &Path,
+    zoom: u8,
+    manifest: &[finalize::ArchiveEntry],
+) -> Result<PathBuf, String> {
+    std::fs::write(
+        work.join("manifest.json"),
+        serde_json::to_vec_pretty(manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let index = out.join("archives.json");
+    std::fs::write(
+        &index,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "zoom": zoom,
+            "format": "AOT1+zstd",
+            "cell_zoom": cells::CELL_ZOOM,
+            "attribution": "© OpenStreetMap contributors, ODbL 1.0",
+            "archives": manifest,
+        }))
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(index)
+}
+
 /// Publishes one continent and reclaims its chunk store.
 ///
 /// Done as soon as a continent's last region is baked rather than at the very end, because all
@@ -115,23 +147,7 @@ fn publish_continent(work: &Path, out: &Path, zoom: u8, continent: &str) -> Resu
             manifest.retain(|e| e.name != continent);
             manifest.push(entry);
             manifest.sort_by(|a, b| a.name.cmp(&b.name));
-            std::fs::write(
-                &manifest_path,
-                serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-            let index = out.join("archives.json");
-            std::fs::write(
-                &index,
-                serde_json::to_vec_pretty(&serde_json::json!({
-                    "zoom": zoom,
-                    "format": "AOT1+zstd",
-                    "attribution": "© OpenStreetMap contributors, ODbL 1.0",
-                    "archives": manifest,
-                }))
-                .map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
+            let index = write_index(work, out, zoom, &manifest)?;
             println!("published {} and updated {}", continent, index.display());
             // Kept, not deleted: clients cache the index for 24h, so the previous archive has
             // to stay reachable until they have all seen the new one.
@@ -392,6 +408,32 @@ fn real_main() -> Result<(), String> {
                 all_bytes as f64 / 1e9,
                 all_disk as f64 / 1e9
             );
+        }
+
+        Cmd::Cells => {
+            let manifest_path = cli.work.join("manifest.json");
+            let mut manifest: Vec<finalize::ArchiveEntry> = serde_json::from_slice(
+                &std::fs::read(&manifest_path).map_err(|e| format!("no manifest.json: {e}"))?,
+            )
+            .map_err(|e| e.to_string())?;
+            for entry in &mut manifest {
+                let path = cli.out.join(&entry.file);
+                let found = cells::scan_archive(&path, tilemath::ZOOM)?;
+                println!("{:24} {} cells", entry.name, found.len());
+                entry.cells = found;
+                if entry.built.is_empty() {
+                    if let Ok(secs) = std::fs::metadata(&path).and_then(|m| {
+                        m.modified()?
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .map_err(std::io::Error::other)
+                    }) {
+                        entry.built = finalize::date_from_secs(secs);
+                    }
+                }
+            }
+            let index = write_index(&cli.work, &cli.out, tilemath::ZOOM, &manifest)?;
+            println!("updated {}", index.display());
         }
 
         Cmd::Inspect { x, y } => {

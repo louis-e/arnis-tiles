@@ -150,7 +150,21 @@ whose bounds overlap the bbox, and falls back to Overpass on any error.
 A tile is as fresh as the extract it was baked from - Geofabrik rebuilds daily, so a weekly
 re-bake keeps the archive within a week of live OSM. Re-run `plan` (the size cache expires
 naturally when you delete `cache/sizes.json`), then `run` against an empty `work/chunks.db`, then
-`finalize`, then upload under a new version prefix.
+`finalize`.
+
+Published archives carry the date they were built (`europe-20260921.pmtiles`) and are never
+overwritten, so `archives.json` is the only file that changes. That is what makes a refresh safe
+to publish in place: clients key their range cache on the filename, so a new bake invalidates it
+by itself and no Arnis release is needed. Upload the new archives first and `archives.json` last,
+then purge it from the CDN cache - until that purge the edge keeps serving the old index, which
+is harmless but means nobody sees the new data.
+
+Clients cache the index for 24h, so leave the superseded archive in place for a day before
+deleting it. `finalize` prints which file that is.
+
+A re-bake writes coverage cells itself. Only an archive built before cells existed needs
+`arnis-tiles cells`, which rescans the files in `out/` (directories only, a second or so) and
+writes them into the index.
 
 ## Testing locally without uploading
 

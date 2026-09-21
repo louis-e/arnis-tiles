@@ -8,6 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 osmpbf = "0.3"
 zstd = "0.13"
+flate2 = "1"
 pmtiles = { version = "0.24", features = ["write"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 reqwest = { version = "0.13", features = ["blocking", "gzip"] }

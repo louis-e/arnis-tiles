@@ -14,12 +14,17 @@ use std::path::Path;
 /// zstd level for published tiles. 19 costs bake time once and saves every download forever.
 const ZSTD_LEVEL: i32 = 19;
 
-/// UTC date as YYYYMMDD, via Howard Hinnant's civil-from-days.
 fn build_date() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    date_from_secs(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    )
+}
+
+/// UTC date as YYYYMMDD, via Howard Hinnant's civil-from-days.
+pub fn date_from_secs(secs: i64) -> String {
     let z = secs.div_euclid(86_400) + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -39,9 +44,13 @@ pub struct ArchiveEntry {
     /// Dated, so every published archive is immutable: a re-bake lands beside the old file
     /// instead of overwriting it, which is what lets clients cache byte ranges safely.
     pub file: String,
+    #[serde(default)]
     pub built: String,
     pub tiles: u64,
     pub bytes: u64,
+    /// Coarse cells this archive actually holds, so a client can skip it without opening it.
+    #[serde(default)]
+    pub cells: Vec<u32>,
     pub min_lat: f64,
     pub min_lon: f64,
     pub max_lat: f64,
@@ -132,6 +141,7 @@ pub fn one(
         .prepare("SELECT data FROM chunk WHERE x=?1 AND y=?2")
         .map_err(|e| e.to_string())?;
     let (mut n, mut raw_total, mut comp_total) = (0u64, 0u64, 0u64);
+    let mut cells = std::collections::BTreeSet::new();
     for (_, x, y) in &with_id {
         let blobs: Vec<Vec<u8>> = blob_stmt
             .query_map(rusqlite::params![x, y], |r| r.get::<_, Vec<u8>>(0))
@@ -148,6 +158,7 @@ pub fn one(
         comp_total += packed.len() as u64;
         let coord = TileCoord::new(zoom, *x, *y).map_err(|e| e.to_string())?;
         writer.add_tile(coord, &packed).map_err(|e| e.to_string())?;
+        cells.insert(crate::cells::cell_of(*x, *y, zoom));
         n += 1;
         if n % 50_000 == 0 {
             eprintln!(
@@ -169,6 +180,7 @@ pub fn one(
         file: format!("{continent}-{built}.pmtiles"),
         built,
         tiles: n,
+        cells: cells.into_iter().collect(),
         // On disk, not the sum of the tiles: the writer stores identical tiles once.
         bytes: std::fs::metadata(&path)
             .map(|m| m.len())
