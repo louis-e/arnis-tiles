@@ -14,13 +14,18 @@ use std::path::Path;
 /// zstd level for published tiles. 19 costs bake time once and saves every download forever.
 const ZSTD_LEVEL: i32 = 19;
 
-fn build_date() -> String {
-    date_from_secs(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
-    )
+/// UTC (YYYYMMDD, YYYYMMDD-HHMMSS) of this build. The file name takes the time too: two bakes
+/// of a continent on one day must not share a name, or a client could read ranges cached from
+/// the first file against the second.
+fn build_stamp() -> (String, String) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let date = date_from_secs(secs);
+    let t = secs.rem_euclid(86_400);
+    let stamp = format!("{date}-{:02}{:02}{:02}", t / 3600, t / 60 % 60, t % 60);
+    (date, stamp)
 }
 
 /// UTC date as YYYYMMDD, via Howard Hinnant's civil-from-days.
@@ -130,8 +135,8 @@ pub fn one(
         .collect();
     with_id.sort_unstable_by_key(|(id, _, _)| *id);
 
-    let built = build_date();
-    let path = out_dir.join(format!("{continent}-{built}.pmtiles"));
+    let (built, stamp) = build_stamp();
+    let path = out_dir.join(format!("{continent}-{stamp}.pmtiles"));
     let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
     let mut writer = PmTilesWriter::new(TileType::Unknown)
         .min_zoom(zoom)
@@ -213,7 +218,7 @@ pub fn one(
 
     Ok(Some(ArchiveEntry {
         name: continent.to_string(),
-        file: format!("{continent}-{built}.pmtiles"),
+        file: format!("{continent}-{stamp}.pmtiles"),
         built,
         tiles: n,
         cells: cells.into_iter().collect(),

@@ -81,7 +81,7 @@ cargo build --release
 #    and it skips whatever is already in the store.
 ./target/release/arnis-tiles run
 
-# 3. Merge into out/<continent>-<date>.pmtiles and out/archives.json.
+# 3. Merge into out/<continent>-<date>-<time>.pmtiles and out/archives.json.
 #    `run` already does this per continent as it finishes; this finishes an interrupted run.
 ./target/release/arnis-tiles finalize
 ```
@@ -133,7 +133,7 @@ small extra archive instead of re-baking a continent.
 # what the published regions miss; prints the patch command to run
 ./target/release/arnis-tiles plan --keep work/plan-<published>.json --to work/plan-patch.json
 
-# bake exactly those regions into out/overlay-<date>.pmtiles and add it to archives.json
+# bake exactly those regions into out/overlay-<date>-<time>.pmtiles and add it to archives.json
 ./target/release/arnis-tiles patch --plan work/plan-patch.json --name overlay <regions...>
 ```
 
@@ -222,8 +222,8 @@ A tile is only as fresh as the extract it came from. Geofabrik rebuilds daily, s
 re-bake keeps the archive within a week of live OSM. Delete `cache/sizes.json` so `plan` re-reads
 sizes, then `run` against an empty chunk store, then `finalize`.
 
-Published archives carry the date they were built (`europe-20260921.pmtiles`) and are never
-overwritten, so `archives.json` is the only file that changes. That is what makes a refresh safe
+Published archives carry the time they were built (`europe-20261018-142233.pmtiles`) and are
+never overwritten, not even by a second bake on the same day, so `archives.json` is the only file that changes. That is what makes a refresh safe
 to publish in place: clients key their range cache on the filename, so a new bake invalidates it
 by itself and no Arnis release is needed.
 
