@@ -1,19 +1,27 @@
-//! The Arnis OSM tile payload ("AOT1").
+//! The Arnis OSM tile payload ("AOT2").
 //!
 //! One tile holds everything Arnis needs to render the ground it covers: tagged POI nodes,
 //! ways with inline geometry, and the relations whose members touch the tile. Way vertices
 //! carry no OSM ids - the decoder mints them from the coordinate, which is what keeps the
 //! archive about a third the size of the equivalent .osm.pbf.
 //!
-//! Coordinates are stored in units of 1e-6 degrees (~0.11 m). Arnis places one block per metre,
-//! so this is an order of magnitude finer than the grid it snaps to: quantisation can no longer
-//! move a wall by a block, which 1e-5 (~1.1 m) occasionally could.
+//! Coordinates are stored in units of 1e-7 degrees, OSM's own precision, so a world built from
+//! the archive matches one built from Overpass block for block. AOT1 stored 1e-6, and rounding
+//! every vertex by up to 5 cm moved about 1.5% of map pixels by a block.
+//!
+//! A relation spanning several tiles is also stored once whole, with all its member ways, at
+//! tile id [`RELATION_TILE_BASE`] + relation id. A tile alone only holds the members that touch
+//! it, so a bbox on a lake shore got 4 of Lake Constance's 83 members and a ragged shore.
 
 use std::collections::HashMap;
 
-pub const MAGIC: &[u8; 4] = b"AOT1";
+pub const MAGIC: &[u8; 4] = b"AOT2";
 /// Degrees per stored coordinate unit.
-pub const COORD_SCALE: f64 = 1e6;
+pub const COORD_SCALE: f64 = 1e7;
+
+/// First tile id of zoom 20 in PMTiles numbering. The archive only holds zoom 13 tiles, so
+/// ids from here on are free for whole relations.
+pub const RELATION_TILE_BASE: u64 = ((1u64 << 40) - 1) / 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
@@ -200,7 +208,7 @@ pub fn encode(tile: &Tile) -> Vec<u8> {
 // ── decode ────────────────────────────────────────────────────────────────────
 pub fn decode(buf: &[u8]) -> Result<Tile, String> {
     if buf.len() < 4 || &buf[..4] != MAGIC {
-        return Err("not an AOT1 tile".into());
+        return Err("not an AOT2 tile".into());
     }
     let mut c = Cursor { buf, pos: 4 };
 
@@ -346,6 +354,33 @@ mod tests {
             }],
         };
         assert_eq!(decode(&encode(&tile)).unwrap(), tile);
+    }
+
+    // 1e-7 at the poles and the antimeridian is past what 1e-6 needed and still inside i32.
+    #[test]
+    fn extreme_coordinates_round_trip_at_full_precision() {
+        let t = Tile {
+            ways: vec![Way {
+                id: 1,
+                closed: false,
+                tags: vec![],
+                points: vec![
+                    (-900_000_000, -1_800_000_000),
+                    (900_000_000, 1_800_000_000),
+                    (1, -1),
+                ],
+            }],
+            ..Tile::default()
+        };
+        assert_eq!(decode(&encode(&t)).unwrap(), t);
+    }
+
+    #[test]
+    fn relation_ids_start_past_every_zoom_13_tile() {
+        let z20 = pmtiles::TileId::from(pmtiles::TileCoord::new(20, 0, 0).unwrap());
+        assert_eq!(u64::from(z20), RELATION_TILE_BASE);
+        let last13 = pmtiles::TileId::from(pmtiles::TileCoord::new(13, 8191, 0).unwrap());
+        assert!(u64::from(last13) < RELATION_TILE_BASE);
     }
 
     #[test]

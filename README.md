@@ -4,7 +4,7 @@ Bakes the OpenStreetMap planet into the Arnis tile archive: a set of PMTiles fil
 hosting that [Arnis](https://github.com/louis-e/arnis) reads over HTTP range requests instead of
 querying a public Overpass API.
 
-One archive per continent, one z13 tile per ~4.9 km square, one zstd-compressed `AOT1` payload
+One archive per continent, one z13 tile per ~4.9 km square, one zstd-compressed `AOT2` payload
 per tile. A city-sized generation reads a few hundred kilobytes and touches no OSM server.
 
 ## Why
@@ -13,17 +13,18 @@ Arnis was banned from `overpass-api.de` for using more than its share
 ([#1347](https://github.com/louis-e/arnis/issues/1347)). The suggestion from the Overpass side
 was to bake planet dumps into something that serves our users directly. This is that.
 
-Same bbox in Andorra (`42.500,1.510,42.515,1.535`), measured on the published archive:
+Same bbox in Andorra (`42.500,1.510,42.515,1.535`), measured on the first published archive:
 
 | | Overpass | tile archive |
 |---|---|---|
 | OSM fetch | 1.74 MB over the wire | 0.29 MB, one tile |
 | requests | 1 | 2 for the index, then 1 per tile |
-| generated world | 20 regions, 86,503,424 bytes | 20 regions, 86,470,656 bytes |
 
-The two worlds differ by 0.04%. Arnis is not bit-deterministic between runs (identical inputs
-drift by a few kilobytes, roughly 0.005%), so most of that gap is the ~0.11 m coordinate
-quantisation, not missing data.
+Arnis renders deterministically, so the two paths can be compared pixel by pixel on the map
+preview (`--map-preview`). On Lake Zurich (`47.362,8.538,47.368,8.548`) the first format, AOT1,
+differed from Overpass in 2.2% of pixels: a ragged shoreline, because the lake's multipolygon
+arrived with most members missing, and one-block jitter from storing 1e-6 degrees. AOT2 differs
+in 0.02%, which is the week between the two data snapshots.
 
 ## What is in a tile
 
@@ -34,6 +35,10 @@ Everything Arnis renders from, and nothing else:
 * ways that are members of a kept relation, tagged or not
 * nodes carrying a rendered key (benches, waste baskets, entrances and so on)
 * relations with those keys, or `type=multipolygon` / `type=building`
+* every relation that spans more than one tile, a second time and whole, with all its member
+  ways, at tile id `RELATION_TILE_BASE + relation id`. A tile alone only holds the members that
+  touch it; Arnis fetches the whole relation when a bbox gets part of one, which is what
+  Overpass's `way(r.relsinbbox)` returned
 * every tag on them except what `osm_parser.rs` already throws away (names, `addr:*` except the
   house number, wikipedia, operator, website, opening hours, source)
 
@@ -50,7 +55,7 @@ have that gap.
 Not in a tile: OSM node ids for way vertices (the decoder mints them from the coordinate, and
 this is most of the size saving), element metadata such as version, timestamp, changeset and user
 (Geofabrik strips those anyway), coastline and ocean features (Arnis resolves those from
-satellite land cover), and coordinate precision finer than ~0.11 m.
+satellite land cover). Coordinates keep OSM's own 1e-7 degrees.
 
 ## Requirements
 
@@ -181,8 +186,10 @@ rclone check out/ r2:arnis-tiles/v1/ --size-only --s3-no-check-bucket
 `--s3-no-check-bucket` matters: a scoped token cannot call CreateBucket, and rclone tries to by
 default.
 
-The `v1/` prefix is the format version, not the build. Bump it only when the tile format changes
-in a way older clients cannot read, because clients have the old prefix compiled in.
+Arnis reads AOT1 and AOT2 archives alike, tile by tile, so a re-bake in the new format is
+published into the same `v1/` prefix under new dated filenames and switched to by
+`archives.json`, with no Arnis release. Change the prefix only for a format today's clients
+cannot read, because they have it compiled in.
 
 ### Serving it
 

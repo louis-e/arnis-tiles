@@ -137,7 +137,12 @@ pub fn scan_archive(path: &Path, zoom: u8) -> Result<Vec<u32>, String> {
     };
 
     let mut cells = BTreeSet::new();
+    // Whole-relation records sit past the zoom 13 ids and are not places.
+    let past_zoom = ((1u64 << (2 * (zoom + 1))) - 1) / 3;
     let note = |id: u64, run: u64, cells: &mut BTreeSet<u32>| {
+        if id >= past_zoom {
+            return;
+        }
         for k in 0..run.min(1 << 20) {
             let (x, y) = tile_xy(zoom, id + k);
             cells.insert(cell_of(x, y, zoom));

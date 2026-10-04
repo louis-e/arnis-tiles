@@ -5,7 +5,7 @@
 //! finished tile, so a client spends one range request and one decompress per tile.
 
 use crate::format::{self, Tile};
-use crate::store::ChunkStore;
+use crate::store::{ChunkStore, RELATION_X};
 use pmtiles::{PmTilesWriter, TileCoord, TileType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -98,7 +98,9 @@ pub fn one(
     let conn = store.connection();
 
     let mut stmt = conn
-        .prepare("SELECT DISTINCT x,y FROM chunk")
+        .prepare(&format!(
+            "SELECT DISTINCT x,y FROM chunk WHERE x<>{RELATION_X}"
+        ))
         .map_err(|e| e.to_string())?;
     let coords: Vec<(u32, u32)> = stmt
         .query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?)))
@@ -167,6 +169,40 @@ pub fn one(
             );
         }
     }
+    // Whole relations after the tiles: their ids sit above every zoom 13 id, so the writer still
+    // sees ids in increasing order.
+    let mut rel_stmt = conn
+        .prepare(&format!(
+            "SELECT DISTINCT y FROM chunk WHERE x={RELATION_X} ORDER BY y"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rel_ids: Vec<u32> = rel_stmt
+        .query_map([], |r| r.get::<_, u32>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut records = 0u64;
+    for rid in rel_ids {
+        let blobs: Vec<Vec<u8>> = blob_stmt
+            .query_map(rusqlite::params![RELATION_X, rid], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        let record = merge(&blobs)?;
+        let encoded = format::encode(&record);
+        let packed = zstd::encode_all(&encoded[..], ZSTD_LEVEL).map_err(|e| e.to_string())?;
+        raw_total += encoded.len() as u64;
+        comp_total += packed.len() as u64;
+        let id = pmtiles::TileId::new(format::RELATION_TILE_BASE + u64::from(rid))
+            .map_err(|e| e.to_string())?;
+        writer
+            .add_tile(TileCoord::from(id), &packed)
+            .map_err(|e| e.to_string())?;
+        records += 1;
+    }
+    eprintln!("  {continent}: {records} whole relations");
     writer.finalize().map_err(|e| e.to_string())?;
     eprintln!(
         "{}: {n} tiles, {:.2} GB raw -> {:.2} GB zstd",

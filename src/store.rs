@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 /// Fast level: this data is read once, by finalize, which re-compresses at 19 for publication.
 const CHUNK_ZSTD_LEVEL: i32 = 3;
 
+/// `x` of a whole-relation row, whose `y` is then the relation id. Tile x never gets near it.
+pub const RELATION_X: u32 = u32::MAX;
+
 /// One store per continent, named so `finalize` can find them by globbing.
 pub fn store_path(work: &Path, continent: &str) -> PathBuf {
     work.join(format!("chunks-{continent}.db"))
@@ -42,7 +45,10 @@ impl ChunkStore {
                  x INTEGER NOT NULL, y INTEGER NOT NULL,
                  region TEXT NOT NULL, data BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS done(
-                 region TEXT PRIMARY KEY, bytes INTEGER, tiles INTEGER, finished_at TEXT);",
+                 region TEXT PRIMARY KEY, bytes INTEGER, tiles INTEGER, finished_at TEXT);
+             CREATE TABLE IF NOT EXISTS member(
+                 way_id INTEGER NOT NULL, region TEXT NOT NULL, data BLOB NOT NULL);
+             CREATE INDEX IF NOT EXISTS member_way ON member(region, way_id);",
         )
         .map_err(|e| e.to_string())?;
         Ok(Self { conn, in_tx: false })
@@ -75,6 +81,39 @@ impl ChunkStore {
                 "INSERT INTO chunk(x,y,region,data) VALUES (?1,?2,?3,?4)",
                 rusqlite::params![x, y, region, packed],
             )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// A relation member way, kept on disk while its region bakes: a big extract has millions
+    /// of them and the node table already takes most of the RAM.
+    pub fn put_member(&self, way_id: u64, region: &str, data: &[u8]) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO member(way_id,region,data) VALUES (?1,?2,?3)",
+                rusqlite::params![way_id as i64, region, data],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn member(&self, way_id: u64, region: &str) -> Result<Option<Vec<u8>>, String> {
+        self.conn
+            .query_row(
+                "SELECT data FROM member WHERE region=?1 AND way_id=?2 LIMIT 1",
+                rusqlite::params![region, way_id as i64],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.to_string()),
+            })
+    }
+
+    pub fn clear_members(&self, region: &str) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM member WHERE region=?1", [region])
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -126,33 +165,11 @@ impl ChunkStore {
 
     /// Drops a half-written region so a re-run cannot double-insert its tiles.
     pub fn clear_region(&self, region: &str) -> Result<(), String> {
+        self.clear_members(region)?;
         self.conn
             .execute("DELETE FROM chunk WHERE region=?1", [region])
             .map(|_| ())
             .map_err(|e| e.to_string())
-    }
-
-    /// Keeps only this region's tiles inside `boxes` (x0, y0, x1, y1 inclusive), returning how
-    /// many rows went. For supplements, which are baked for a few islands of a big extract.
-    pub fn clip_region(
-        &self,
-        region: &str,
-        boxes: &[(u32, u32, u32, u32)],
-    ) -> Result<usize, String> {
-        if boxes.is_empty() {
-            return Ok(0);
-        }
-        let keep: Vec<String> = boxes
-            .iter()
-            .map(|(x0, y0, x1, y1)| {
-                format!("(x BETWEEN {x0} AND {x1} AND y BETWEEN {y0} AND {y1})")
-            })
-            .collect();
-        let sql = format!(
-            "DELETE FROM chunk WHERE region=?1 AND NOT ({})",
-            keep.join(" OR ")
-        );
-        self.conn.execute(&sql, [region]).map_err(|e| e.to_string())
     }
 
     pub fn index_for_finalize(&self) -> Result<(), String> {
@@ -163,5 +180,27 @@ impl ChunkStore {
 
     pub fn connection(&self) -> &Connection {
         &self.conn
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn members_are_per_region_and_cleared_with_it() {
+        let dir = std::env::temp_dir().join(format!("arnis-tiles-store-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let st = ChunkStore::open(&dir).unwrap();
+        st.put_member(7, "a", b"x").unwrap();
+        st.put_member(7, "b", b"y").unwrap();
+        assert_eq!(st.member(7, "a").unwrap().as_deref(), Some(&b"x"[..]));
+        st.clear_region("a").unwrap();
+        assert_eq!(st.member(7, "a").unwrap(), None);
+        assert_eq!(st.member(7, "b").unwrap().as_deref(), Some(&b"y"[..]));
+        drop(st);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", dir.display()));
+        }
     }
 }

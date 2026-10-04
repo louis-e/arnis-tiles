@@ -9,7 +9,7 @@
 //! a tile split across several flushes is merged at finalize like any other multi-writer tile.
 
 use crate::format::{self, Node, Relation, Tile, Way};
-use crate::store::ChunkStore;
+use crate::store::{ChunkStore, RELATION_X};
 use crate::tags;
 use crate::tilemath;
 use osmpbf::{Element, ElementReader, RelMemberType};
@@ -45,6 +45,10 @@ struct Sink<'a> {
     region: &'a str,
     bytes: u64,
     rows: usize,
+    /// Tile ranges (x0, y0, x1, y1) to keep; empty keeps everything.
+    keep: &'a [(u32, u32, u32, u32)],
+    members: Vec<(u64, Vec<u8>)>,
+    member_bytes: usize,
 }
 
 /// Flush threshold. Small enough that a dense extract stays well inside a laptop's memory,
@@ -52,12 +56,50 @@ struct Sink<'a> {
 const FLUSH_BYTES: usize = 192 * 1024 * 1024;
 
 impl Sink<'_> {
+    fn kept(&self, (x, y): (u32, u32)) -> bool {
+        self.keep.is_empty()
+            || self
+                .keep
+                .iter()
+                .any(|(x0, y0, x1, y1)| (*x0..=*x1).contains(&x) && (*y0..=*y1).contains(&y))
+    }
+
+    /// Parks a relation member way on disk for the whole-relation records.
+    fn member(&mut self, way: &Way) -> Result<(), String> {
+        let blob = format::encode(&Tile {
+            ways: vec![way.clone()],
+            ..Tile::default()
+        });
+        self.member_bytes += blob.len();
+        self.members.push((way.id, blob));
+        if self.member_bytes >= FLUSH_BYTES / 4 {
+            self.flush_members()?;
+        }
+        Ok(())
+    }
+
+    fn flush_members(&mut self) -> Result<(), String> {
+        if self.members.is_empty() {
+            return Ok(());
+        }
+        self.store.begin()?;
+        for (id, blob) in self.members.drain(..) {
+            self.store.put_member(id, self.region, &blob)?;
+        }
+        self.store.commit()?;
+        self.member_bytes = 0;
+        Ok(())
+    }
+
     fn add(
         &mut self,
         tile: (u32, u32),
         weight: usize,
         f: impl FnOnce(&mut Tile),
     ) -> Result<(), String> {
+        if !self.kept(tile) {
+            return Ok(());
+        }
         f(self.tiles.entry(tile).or_default());
         *self.weights.entry(tile).or_default() += weight;
         self.pending += weight;
@@ -125,11 +167,20 @@ pub struct Stats {
     pub nodes: u64,
     pub ways: u64,
     pub relations: u64,
+    /// Relations also stored whole, because they span more than one tile.
+    pub records: u64,
     pub tiles: usize,
     pub bytes: u64,
 }
 
-pub fn bake(pbf: &Path, store: &mut ChunkStore, region: &str, zoom: u8) -> Result<Stats, String> {
+/// `keep` limits the output to those tile ranges, for supplements baked for a few islands.
+pub fn bake(
+    pbf: &Path,
+    store: &mut ChunkStore,
+    region: &str,
+    zoom: u8,
+    keep: &[(u32, u32, u32, u32)],
+) -> Result<Stats, String> {
     let open = || ElementReader::from_path(pbf).map_err(|e| format!("{}: {e}", pbf.display()));
 
     // ── pass 0: relations ────────────────────────────────────────────────────
@@ -175,6 +226,9 @@ pub fn bake(pbf: &Path, store: &mut ChunkStore, region: &str, zoom: u8) -> Resul
         region,
         bytes: 0,
         rows: 0,
+        keep,
+        members: Vec::new(),
+        member_bytes: 0,
     };
     let mut coords: Vec<(i64, i32, i32)> = Vec::new();
     let mut n_pois = 0u64;
@@ -304,6 +358,10 @@ pub fn bake(pbf: &Path, store: &mut ChunkStore, region: &str, zoom: u8) -> Resul
                 }
             }
             if is_member {
+                if let Err(e) = sink.member(&way) {
+                    way_err = Some(e);
+                    return;
+                }
                 way_tiles.insert(way.id, touched);
             }
             n_ways += 1;
@@ -319,34 +377,66 @@ pub fn bake(pbf: &Path, store: &mut ChunkStore, region: &str, zoom: u8) -> Resul
     // A relation goes wherever its members went, so a tile that holds part of a multipolygon
     // also holds the relation that explains it.
     let mut n_rels = 0u64;
-    for r in relations {
-        let mut where_to: Vec<(u32, u32)> = Vec::new();
-        for (wid, _) in &r.members {
-            if let Some(ts) = way_tiles.get(wid) {
-                for t in ts {
-                    if !where_to.contains(t) {
-                        where_to.push(*t);
-                    }
-                }
-            }
-        }
+    sink.flush_members()?;
+    let mut spans: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
+    for (k, r) in relations.iter().enumerate() {
+        let mut where_to: Vec<(u32, u32)> = r
+            .members
+            .iter()
+            .filter_map(|(wid, _)| way_tiles.get(wid))
+            .flatten()
+            .copied()
+            .collect();
+        where_to.sort_unstable();
+        where_to.dedup();
         if where_to.is_empty() {
             continue;
         }
         n_rels += 1;
         let weight = weigh(&r.tags, r.members.len());
-        for t in where_to {
+        for t in &where_to {
             let copy = r.clone();
-            sink.add(t, weight, |tile| tile.relations.push(copy))?;
+            sink.add(*t, weight, |tile| tile.relations.push(copy))?;
+        }
+        if where_to.len() > 1 && where_to.iter().any(|t| sink.kept(*t)) {
+            spans.push((k, where_to));
         }
     }
-
     sink.flush()?;
+
+    // A tile only holds the members that touch it, so a relation over several tiles is also
+    // stored whole once; Arnis fetches it when a bbox has only part of it.
+    let mut n_records = 0u64;
+    sink.store.begin()?;
+    for (k, _) in &spans {
+        let r = &relations[*k];
+        let Ok(rid) = u32::try_from(r.id) else {
+            continue;
+        };
+        let mut record = Tile {
+            relations: vec![r.clone()],
+            ..Tile::default()
+        };
+        for (wid, _) in &r.members {
+            if let Some(blob) = sink.store.member(*wid, region)? {
+                record.ways.extend(format::decode(&blob)?.ways);
+            }
+        }
+        record.ways.sort_by_key(|w| w.id);
+        record.ways.dedup_by_key(|w| w.id);
+        let blob = format::encode(&record);
+        sink.store.put(RELATION_X, rid, region, &blob)?;
+        sink.bytes += blob.len() as u64;
+        n_records += 1;
+    }
+    sink.store.commit()?;
+    sink.store.clear_members(region)?;
 
     Ok(Stats {
         nodes: n_pois,
         ways: n_ways,
         relations: n_rels,
+        records: n_records,
         tiles: sink.rows,
         bytes: sink.bytes,
     })

@@ -133,7 +133,7 @@ fn write_index(
         &index,
         serde_json::to_vec_pretty(&serde_json::json!({
             "zoom": zoom,
-            "format": "AOT1+zstd",
+            "format": "AOT2+zstd",
             "cell_zoom": cells::CELL_ZOOM,
             "attribution": "© OpenStreetMap contributors, ODbL 1.0",
             "archives": manifest,
@@ -207,33 +207,31 @@ fn bake_into(
     keep_pbf: bool,
 ) -> Result<(), String> {
     let t0 = std::time::Instant::now();
-    let s = bake::bake(pbf, st, &r.id, zoom)?;
-    let mut note = String::new();
-    if !r.clip.is_empty() {
-        let boxes: Vec<(u32, u32, u32, u32)> = r
-            .clip
-            .iter()
-            .map(|[w, s, e, n]| {
-                let (x0, y0) = tilemath::tile_of(*n, *w, zoom);
-                let (x1, y1) = tilemath::tile_of(*s, *e, zoom);
-                (x0, y0, x1, y1)
-            })
-            .collect();
-        let dropped = st.clip_region(&r.id, &boxes)?;
-        note = format!(
-            ", clipped to {} boxes ({dropped} rows dropped)",
-            boxes.len()
-        );
-    }
+    let keep: Vec<(u32, u32, u32, u32)> = r
+        .clip
+        .iter()
+        .map(|[w, s, e, n]| {
+            let (x0, y0) = tilemath::tile_of(*n, *w, zoom);
+            let (x1, y1) = tilemath::tile_of(*s, *e, zoom);
+            (x0, y0, x1, y1)
+        })
+        .collect();
+    let s = bake::bake(pbf, st, &r.id, zoom, &keep)?;
+    let note = if keep.is_empty() {
+        String::new()
+    } else {
+        format!(", clipped to {} boxes", keep.len())
+    };
     st.mark_done(&r.id, s.bytes, s.tiles)?;
     if !keep_pbf {
         let _ = std::fs::remove_file(pbf);
     }
     println!(
-        "    {} ways, {} pois, {} relations -> {} tiles, {:.0} MB in {:.0}s{note}",
+        "    {} ways, {} pois, {} relations ({} whole) -> {} tiles, {:.0} MB in {:.0}s{note}",
         s.ways,
         s.nodes,
         s.relations,
+        s.records,
         s.tiles,
         s.bytes as f64 / 1e6,
         t0.elapsed().as_secs_f64()
