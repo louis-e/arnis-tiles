@@ -42,6 +42,11 @@ all survive. The way filter is deliberately "anything tagged" rather than a key 
 key list kept silently dropping tags that Arnis renders through less obvious paths
 (`area:aeroway`, `service=siding`, `ruins:building` and others).
 
+A way is stored in every tile its segments pass through, not only the tiles holding one of its
+vertices. Before that change a long straight segment (the Eyre Highway across the Nullarbor) was
+missing from a tile it crossed without a vertex in it. Archives baked before October 2026 still
+have that gap.
+
 Not in a tile: OSM node ids for way vertices (the decoder mints them from the coordinate, and
 this is most of the size saving), element metadata such as version, timestamp, changeset and user
 (Geofabrik strips those anyway), coastline and ocean features (Arnis resolves those from
@@ -52,7 +57,8 @@ satellite land cover), and coordinate precision finer than ~0.11 m.
 * Rust stable
 * about 120 GB free disk at peak. `out/` ends up around 74 GB and the chunk store for the
   continent being baked sits alongside it
-* about 8 GB free RAM. The largest planned extract is 2.26 GB and its node table dominates
+* about 8 GB free RAM. The largest planned extract is japan at 2.53 GB, and a 2.26 GB one
+  peaked at 4.7 GB
 * a connection you are happy to pull 86 GB over
 
 ## Running a full bake
@@ -60,9 +66,10 @@ satellite land cover), and coordinate precision finer than ~0.11 m.
 ```sh
 cargo build --release
 
-# 1. Work out which extracts cover the world. Writes work/plan.json.
-#    The first run HEADs all 555 Geofabrik extracts for their sizes and range-reads the headers
-#    of the few with no cutting polygon. Both are cached under cache/.
+# 1. Work out which extracts cover the world. Writes work/plan.json and lists any land it
+#    cannot reach. The first run HEADs every extract for its size, range-reads the headers of
+#    the few with no cutting polygon and fetches Natural Earth's land polygons; all of it is
+#    cached under cache/.
 ./target/release/arnis-tiles plan
 
 # 2. Download, bake and delete each extract in turn. Resumable: rerun after any interruption
@@ -74,13 +81,62 @@ cargo build --release
 ./target/release/arnis-tiles finalize
 ```
 
-The published planet is 305 extracts, 86 GB downloaded, 9,149,800 tiles, 74 GB in `out/`. Wall
-clock is dominated by bandwidth rather than CPU; budget the better part of a day on a laptop.
+The published planet is 305 extracts, 86 GB downloaded, 9,149,800 tiles, 74 GB in `out/`. The
+current planner picks 366 extracts and 83 GB for the next bake. Wall clock is dominated by
+bandwidth rather than CPU; budget the better part of a day on a laptop.
 Peak disk stays near one chunk store plus the archives written so far, because each continent is
 published and its store deleted as soon as its last region is baked.
 
 Check on it with `arnis-tiles status`, and look inside a single tile with `arnis-tiles inspect
 <x> <y>`.
+
+### How the plan is made
+
+The plan has to reach every piece of land, and it is easy to get that subtly wrong. The first
+published bake missed Washington DC, Liechtenstein and Lesotho entirely, plus a dozen remote
+territories, without any error. What the planner does now, and why:
+
+* It samples land only, using Natural Earth's land polygons (public domain, minus lakes). Points
+  come from a 0.25 degree grid, a denser grid inside every ring of every extract scaled to that
+  ring, and a few points inside every island too small for either grid. The old global grid
+  alone had no point inside DC or Liechtenstein that a neighbour did not also cover, so neither
+  was ever baked.
+* A point is inside an extract when it is inside an odd number of its rings. That is how the
+  extracts are actually cut: South Africa's polygon has a hole where Lesotho is, and Geofabrik's
+  kanto has Minami-Torishima inside two rings and leaves it out of the extract.
+* Geofabrik extracts known only by their header box (Kazakhstan, Mongolia and a few more) are
+  always baked, and their box only counts for land no real polygon covers, so a box can never
+  make the plan skip a real extract.
+* `coverage.json` lists supplements from openstreetmap.fr for land no Geofabrik extract under
+  the 3 GB cap holds (Saint Pierre and Miquelon, South Georgia, Diego Garcia, the French Southern
+  Lands and a few islets), and anchors, places the plan must reach that are too small for any
+  sample grid. A supplement only ever covers such land and is clipped to where it is needed.
+  openstreetmap.fr cuts each extract from its parent, so a supplement only counts where its
+  parent polygons reach too.
+* After the greedy cover, a region whose remaining points a much cheaper set also covers is
+  swapped out, and anything fully covered by the rest is dropped.
+
+Two places stay uncovered because no published extract contains them: Kingman Reef and
+Johnston Atoll. The archive has no tiles there, so Arnis falls back to Overpass for them.
+
+### Filling a gap without a re-bake
+
+Arnis reads every archive that covers an area and merges them, so a gap can be filled by a
+small extra archive instead of re-baking a continent.
+
+```sh
+# what the published regions miss; prints the patch command to run
+./target/release/arnis-tiles plan --keep work/plan-<published>.json --to work/plan-patch.json
+
+# bake exactly those regions into out/overlay-<date>.pmtiles and add it to archives.json
+./target/release/arnis-tiles patch --plan work/plan-patch.json --name overlay <regions...>
+```
+
+Each added region is clipped to the places only it covers, so patching two islands with
+Geofabrik's 2.5 GB japan adds 58 tiles, not all of Japan. The patch store is kept, so rerunning
+with a longer list only bakes the new regions. Upload the new overlay file, then
+`archives.json`. On the next full bake the plan includes these regions itself; drop the
+overlay entry from `work/manifest.json` then.
 
 ### A partial bake is useful
 
@@ -183,6 +239,11 @@ range-capable static server works:
 ```sh
 arnis --osm-tiles-url http://127.0.0.1:8787/v1 --bbox "..." --output-dir /tmp/w
 ```
+
+## Data sources
+
+OpenStreetMap data comes from Geofabrik's extracts and, for a handful of territories, from
+openstreetmap.fr's. Natural Earth's land and lake polygons are only used to plan, never baked.
 
 ## Licence
 
