@@ -1,0 +1,144 @@
+{
+  "supplements": [
+    {
+      "id": "osmfr/saint-pierre-et-miquelon",
+      "name": "Saint Pierre and Miquelon",
+      "path": "north-america/saint_pierre_et_miquelon",
+      "continent": "north-america"
+    },
+    {
+      "id": "osmfr/south-georgia-and-south-sandwich",
+      "name": "South Georgia and the South Sandwich Islands",
+      "path": "south-america/south_georgia_and_south_sandwich",
+      "continent": "south-america"
+    },
+    {
+      "id": "osmfr/bouvet-island",
+      "name": "Bouvet Island",
+      "path": "africa/bouvet_island",
+      "continent": "africa"
+    },
+    {
+      "id": "osmfr/taaf-africa",
+      "name": "Scattered Islands (French Southern Lands)",
+      "path": "africa/france_taaf",
+      "continent": "africa"
+    },
+    {
+      "id": "osmfr/taaf-oceania",
+      "name": "Crozet, Kerguelen, Amsterdam and Saint-Paul (French Southern Lands)",
+      "path": "oceania/france_taaf",
+      "continent": "australia-oceania"
+    },
+    {
+      "id": "osmfr/british-indian-ocean-territory",
+      "name": "British Indian Ocean Territory",
+      "path": "asia/british_indian_ocean_territory",
+      "continent": "asia"
+    },
+    {
+      "id": "osmfr/northwest-territories",
+      "name": "Northwest Territories, for the Arctic islets outside Geofabrik's polygon",
+      "path": "north-america/canada/northwest_territories",
+      "continent": "north-america"
+    },
+    {
+      "id": "osmfr/guyana",
+      "name": "Guyana, for the Corentyne river islands",
+      "path": "south-america/guyana",
+      "continent": "south-america"
+    },
+    {
+      "id": "osmfr/suriname",
+      "name": "Suriname, for the Corentyne river islands",
+      "path": "south-america/suriname",
+      "continent": "south-america"
+    }
+  ],
+  "anchors": [
+    {
+      "name": "Saint-Pierre",
+      "at": [-56.177, 46.78]
+    },
+    {
+      "name": "Miquelon",
+      "at": [-56.381, 47.098]
+    },
+    {
+      "name": "Grytviken",
+      "at": [-36.508, -54.281]
+    },
+    {
+      "name": "South Georgia",
+      "at": [-36.492, -54.43]
+    },
+    {
+      "name": "Saunders Island",
+      "at": [-26.35, -58.441]
+    },
+    {
+      "name": "Thule Island",
+      "at": [-26.582, -59.039]
+    },
+    {
+      "name": "Bouvet Island",
+      "at": [3.411, -54.427]
+    },
+    {
+      "name": "Europa Island",
+      "at": [40.344, -22.342]
+    },
+    {
+      "name": "Juan de Nova",
+      "at": [42.746, -17.07]
+    },
+    {
+      "name": "Tromelin",
+      "at": [54.52, -15.89]
+    },
+    {
+      "name": "Ile de la Possession, Crozet",
+      "at": [51.755, -46.387]
+    },
+    {
+      "name": "Ile aux Cochons, Crozet",
+      "at": [50.236, -46.081]
+    },
+    {
+      "name": "Diego Garcia",
+      "at": [72.411, -7.313]
+    },
+    {
+      "name": "Diego Garcia south",
+      "at": [72.435, -7.356]
+    },
+    {
+      "name": "Peros Banhos",
+      "at": [71.348, -6.192]
+    },
+    {
+      "name": "Salomon Islands",
+      "at": [71.265, -6.38]
+    },
+    {
+      "name": "Arctic islet off Prince Patrick Island",
+      "at": [-122.611, 76.335]
+    },
+    {
+      "name": "Arctic islet off Prince Patrick Island 2",
+      "at": [-122.829, 76.226]
+    },
+    {
+      "name": "Corentyne river islands",
+      "at": [-57.156, 5.76]
+    },
+    {
+      "name": "Minami-Torishima",
+      "at": [153.979, 24.287]
+    },
+    {
+      "name": "Okinotorishima",
+      "at": [136.0797, 20.4256]
+    }
+  ]
+}

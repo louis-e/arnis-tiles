@@ -8,13 +8,14 @@ mod cells;
 mod download;
 mod finalize;
 mod format;
+mod land;
 mod plan;
 mod store;
 mod tags;
 mod tilemath;
 
 use clap::{Parser, Subcommand};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -36,7 +37,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Work out which extracts cover the world, cheapest first. Writes work/plan.json.
-    Plan,
+    Plan {
+        /// A published plan whose regions stay. Only what they miss is added, and the result
+        /// is written to `--to` instead of work/plan.json; `patch` then bakes the additions.
+        #[arg(long, requires = "to")]
+        keep: Option<PathBuf>,
+        #[arg(long)]
+        to: Option<PathBuf>,
+    },
     /// Download, bake and delete each planned extract. Resumable: finished regions are skipped.
     Run {
         /// Bake only these region ids (default: everything in the plan).
@@ -60,6 +68,21 @@ enum Cmd {
     },
     /// Decode one tile out of the chunk store (debugging).
     Inspect { x: u32, y: u32 },
+    /// Bake a few plan regions into one extra archive published beside the continents.
+    /// Arnis reads every archive covering an area and merges them, so a patch only has to carry
+    /// what the continent archives lack, and a gap is filled without re-baking a continent. The
+    /// archive is rebuilt from exactly the regions given.
+    Patch {
+        /// Archive name, which is also its entry in archives.json.
+        #[arg(long, default_value = "overlay")]
+        name: String,
+        /// Plan the region ids come from (default work/plan.json).
+        #[arg(long)]
+        plan: Option<PathBuf>,
+        /// Region ids as they appear in that plan.
+        #[arg(required = true, num_args = 1..)]
+        regions: Vec<String>,
+    },
     /// Backfill coverage cells into the index by scanning the published archives in out/.
     /// Only needed for archives baked before cells existed; `run` writes them itself.
     Cells,
@@ -127,7 +150,14 @@ fn write_index(
 /// the stores together do not fit: the planet's chunks come to ~103 GB, and turning each
 /// continent into its (smaller) archive as it completes keeps peak disk near one store plus the
 /// archives written so far.
-fn publish_continent(work: &Path, out: &Path, zoom: u8, continent: &str) -> Result<(), String> {
+/// `keep_store` leaves the chunk store in place, for patches that are extended later.
+fn publish_continent(
+    work: &Path,
+    out: &Path,
+    zoom: u8,
+    continent: &str,
+    keep_store: bool,
+) -> Result<(), String> {
     let store_path = store::store_path(work, continent);
     if !store_path.exists() {
         return Ok(());
@@ -156,10 +186,58 @@ fn publish_continent(work: &Path, out: &Path, zoom: u8, continent: &str) -> Resu
             }
         }
     }
+    if keep_store {
+        return Ok(());
+    }
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", store_path.display()));
     }
     std::fs::write(finalized_marker(work, continent), b"").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Bakes one downloaded extract into `st`, clips it if the plan says so, and marks it done.
+/// Clipping happens before the done mark, so a crash in between re-bakes rather than leaving a
+/// whole supplement in the store.
+fn bake_into(
+    st: &mut store::ChunkStore,
+    r: &plan::Region,
+    pbf: &Path,
+    zoom: u8,
+    keep_pbf: bool,
+) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
+    let s = bake::bake(pbf, st, &r.id, zoom)?;
+    let mut note = String::new();
+    if !r.clip.is_empty() {
+        let boxes: Vec<(u32, u32, u32, u32)> = r
+            .clip
+            .iter()
+            .map(|[w, s, e, n]| {
+                let (x0, y0) = tilemath::tile_of(*n, *w, zoom);
+                let (x1, y1) = tilemath::tile_of(*s, *e, zoom);
+                (x0, y0, x1, y1)
+            })
+            .collect();
+        let dropped = st.clip_region(&r.id, &boxes)?;
+        note = format!(
+            ", clipped to {} boxes ({dropped} rows dropped)",
+            boxes.len()
+        );
+    }
+    st.mark_done(&r.id, s.bytes, s.tiles)?;
+    if !keep_pbf {
+        let _ = std::fs::remove_file(pbf);
+    }
+    println!(
+        "    {} ways, {} pois, {} relations -> {} tiles, {:.0} MB in {:.0}s{note}",
+        s.ways,
+        s.nodes,
+        s.relations,
+        s.tiles,
+        s.bytes as f64 / 1e6,
+        t0.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -181,10 +259,22 @@ fn real_main() -> Result<(), String> {
     std::fs::create_dir_all(&cli.work).map_err(|e| e.to_string())?;
 
     match cli.cmd {
-        Cmd::Plan => {
-            let p = plan::build(&cli.cache, tilemath::ZOOM)?;
+        Cmd::Plan { keep, to } => {
+            let kept: Vec<plan::Region> = match &keep {
+                Some(path) => {
+                    let raw =
+                        std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+                    serde_json::from_slice::<plan::Plan>(&raw)
+                        .map_err(|e| e.to_string())?
+                        .regions
+                }
+                None => Vec::new(),
+            };
+            let kept_ids: HashSet<String> = kept.iter().map(|r| r.id.clone()).collect();
+            let p = plan::build(&cli.cache, tilemath::ZOOM, &kept_ids)?;
+            let dest = to.clone().unwrap_or_else(|| plan_path(&cli.work));
             std::fs::write(
-                plan_path(&cli.work),
+                &dest,
                 serde_json::to_vec_pretty(&p).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
@@ -194,9 +284,27 @@ fn real_main() -> Result<(), String> {
                 p.total_bytes as f64 / 1e9
             );
             println!(
-                "sample coverage: {} points covered, {} uncovered (open sea)",
+                "{} land sample points, {} not covered",
                 p.covered_points, p.uncovered_points
             );
+            for [lon, lat, n] in p.uncovered_land.iter().take(25) {
+                println!("  uncovered land near {lat:.3},{lon:.3} ({n} samples)");
+            }
+            if keep.is_some() {
+                let added: Vec<&str> = p
+                    .regions
+                    .iter()
+                    .filter(|r| !kept_ids.contains(&r.id))
+                    .map(|r| r.id.as_str())
+                    .collect();
+                println!("{} regions missing from the published set:", added.len());
+                println!(
+                    "  arnis-tiles patch --plan {} {}",
+                    dest.display(),
+                    added.join(" ")
+                );
+                return Ok(());
+            }
             println!("largest: ");
             for r in p.regions.iter().take(5) {
                 println!("  {:28} {:.2} GB", r.id, r.bytes as f64 / 1e9);
@@ -297,21 +405,7 @@ fn real_main() -> Result<(), String> {
                             ));
                         }
                     }
-                    let t0 = std::time::Instant::now();
-                    let s = bake::bake(&path, st, &r.id, p.zoom)?;
-                    st.mark_done(&r.id, s.bytes, s.tiles)?;
-                    if !keep_pbf {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                    println!(
-                        "    {} ways, {} pois, {} relations -> {} tiles, {:.0} MB in {:.0}s",
-                        s.ways,
-                        s.nodes,
-                        s.relations,
-                        s.tiles,
-                        s.bytes as f64 / 1e6,
-                        t0.elapsed().as_secs_f64()
-                    );
+                    bake_into(st, r, &path, p.zoom, keep_pbf)?;
                 }
 
                 // Last region of this continent? Publish it now and give the disk back.
@@ -323,7 +417,7 @@ fn real_main() -> Result<(), String> {
                     .is_some_and(|rest| rest.iter().any(|n| n.continent == r.continent));
                 if !more_here {
                     stores.remove(&r.continent);
-                    publish_continent(&cli.work, &cli.out, p.zoom, &r.continent)?;
+                    publish_continent(&cli.work, &cli.out, p.zoom, &r.continent, false)?;
                 }
             }
             println!("run complete");
@@ -337,7 +431,7 @@ fn real_main() -> Result<(), String> {
             continents.dedup();
 
             for continent in continents {
-                publish_continent(&cli.work, &cli.out, p.zoom, &continent)?;
+                publish_continent(&cli.work, &cli.out, p.zoom, &continent, false)?;
             }
         }
 
@@ -408,6 +502,64 @@ fn real_main() -> Result<(), String> {
                 all_bytes as f64 / 1e9,
                 all_disk as f64 / 1e9
             );
+        }
+
+        Cmd::Patch {
+            name,
+            plan: plan_file,
+            regions,
+        } => {
+            let p = match plan_file {
+                Some(path) => serde_json::from_slice::<plan::Plan>(
+                    &std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?,
+                )
+                .map_err(|e| e.to_string())?,
+                None => load_plan(&cli.work)?,
+            };
+            if p.regions.iter().any(|r| r.continent == name) {
+                return Err(format!(
+                    "{name} is a continent in the plan; pick another name"
+                ));
+            }
+            let picked = regions
+                .iter()
+                .map(|id| {
+                    p.regions
+                        .iter()
+                        .find(|r| &r.id == id)
+                        .ok_or_else(|| format!("{id} is not in the plan"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // The store is kept between patches: regions already baked are reused, and any no
+            // longer listed are dropped, so the archive matches the list exactly.
+            let path = store::store_path(&cli.work, &name);
+            let mut st = store::ChunkStore::open(&path)?;
+            for gone in st.regions()? {
+                if !regions.contains(&gone) {
+                    println!("dropping {gone}, no longer listed");
+                    st.clear_region(&gone)?;
+                    st.forget(&gone)?;
+                }
+            }
+            let pbf_dir = cli.work.join("pbf");
+            for (i, r) in picked.iter().enumerate() {
+                if st.is_done(&r.id)? {
+                    println!("[{}/{}] {} already baked", i + 1, picked.len(), r.id);
+                    continue;
+                }
+                println!(
+                    "[{}/{}] {} ({:.1} MB)",
+                    i + 1,
+                    picked.len(),
+                    r.id,
+                    r.bytes as f64 / 1e6
+                );
+                st.clear_region(&r.id)?;
+                let pbf = download::fetch(&r.url, &pbf_dir, r.bytes, false)?;
+                bake_into(&mut st, r, &pbf, p.zoom, false)?;
+            }
+            drop(st);
+            publish_continent(&cli.work, &cli.out, p.zoom, &name, true)?;
         }
 
         Cmd::Cells => {

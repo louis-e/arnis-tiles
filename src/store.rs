@@ -105,12 +105,54 @@ impl ChunkStore {
             .map_err(|e| e.to_string())
     }
 
+    /// Every region with rows or a done mark.
+    pub fn regions(&self) -> Result<Vec<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT region FROM done UNION SELECT DISTINCT region FROM chunk")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn forget(&self, region: &str) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM done WHERE region=?1", [region])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// Drops a half-written region so a re-run cannot double-insert its tiles.
     pub fn clear_region(&self, region: &str) -> Result<(), String> {
         self.conn
             .execute("DELETE FROM chunk WHERE region=?1", [region])
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    /// Keeps only this region's tiles inside `boxes` (x0, y0, x1, y1 inclusive), returning how
+    /// many rows went. For supplements, which are baked for a few islands of a big extract.
+    pub fn clip_region(
+        &self,
+        region: &str,
+        boxes: &[(u32, u32, u32, u32)],
+    ) -> Result<usize, String> {
+        if boxes.is_empty() {
+            return Ok(0);
+        }
+        let keep: Vec<String> = boxes
+            .iter()
+            .map(|(x0, y0, x1, y1)| {
+                format!("(x BETWEEN {x0} AND {x1} AND y BETWEEN {y0} AND {y1})")
+            })
+            .collect();
+        let sql = format!(
+            "DELETE FROM chunk WHERE region=?1 AND NOT ({})",
+            keep.join(" OR ")
+        );
+        self.conn.execute(&sql, [region]).map_err(|e| e.to_string())
     }
 
     pub fn index_for_finalize(&self) -> Result<(), String> {
