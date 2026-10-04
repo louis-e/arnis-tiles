@@ -33,9 +33,19 @@ pub fn fetch(url: &str, dir: &Path, hint: u64, quiet: bool) -> Result<PathBuf, S
     Err(format!("after {ATTEMPTS} attempts: {last}"))
 }
 
+/// Host and path, flattened. The basename alone collides: Geofabrik has a `georgia` in Europe
+/// and one under `us`, and openstreetmap.fr's `kanto` shares Geofabrik's file name. A file here
+/// counts as already downloaded, so a collision would bake the wrong region.
+fn local_name(url: &str) -> String {
+    url.split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .replace(['/', '\\', ':'], "_")
+}
+
 fn fetch_once(url: &str, dir: &Path, hint: u64, quiet: bool) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let name = url.rsplit('/').next().ok_or("bad url")?;
+    let name = local_name(url);
+    let name = name.as_str();
     let final_path = dir.join(name);
     let part = dir.join(format!("{name}.part"));
 
@@ -99,4 +109,22 @@ fn fetch_once(url: &str, dir: &Path, hint: u64, quiet: bool) -> Result<PathBuf, 
     }
     std::fs::rename(&part, &final_path).map_err(|e| e.to_string())?;
     Ok(final_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_name;
+
+    #[test]
+    fn same_basename_different_files() {
+        let a = local_name("https://download.geofabrik.de/europe/georgia-latest.osm.pbf");
+        let b = local_name("https://download.geofabrik.de/north-america/us/georgia-latest.osm.pbf");
+        let c = local_name(
+            "https://download.openstreetmap.fr/extracts/asia/japan/kanto-latest.osm.pbf",
+        );
+        let d = local_name("https://download.geofabrik.de/asia/japan/kanto-latest.osm.pbf");
+        assert_ne!(a, b);
+        assert_ne!(c, d);
+        assert!(!a.contains('/'));
+    }
 }
