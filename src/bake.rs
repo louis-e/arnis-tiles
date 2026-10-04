@@ -273,11 +273,19 @@ pub fn bake(pbf: &Path, store: &mut ChunkStore, region: &str, zoom: u8) -> Resul
 
             let mut touched: Vec<(u32, u32)> = Vec::new();
             for (lat, lon) in &points {
-                let tl = tilemath::tile_of(deg(*lat), deg(*lon), zoom);
-                if !touched.contains(&tl) {
-                    touched.push(tl);
-                }
+                touched.push(tilemath::tile_of(deg(*lat), deg(*lon), zoom));
             }
+            for pair in points.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                tilemath::segment_tiles(
+                    (deg(a.0), deg(a.1)),
+                    (deg(b.0), deg(b.1)),
+                    zoom,
+                    &mut touched,
+                );
+            }
+            touched.sort_unstable();
+            touched.dedup();
             if way_err.is_some() {
                 return;
             }
