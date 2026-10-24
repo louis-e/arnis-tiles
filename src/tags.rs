@@ -19,6 +19,8 @@ const WANTED_KEYS: &[&str] = &[
     "bridge",
     "railway",
     "roller_coaster",
+    "aerialway",
+    "attraction",
     "barrier",
     "entrance",
     "door",
@@ -187,6 +189,15 @@ mod tests {
         // ...but ordinary inland water stays.
         assert!(way_is_wanted(&t(&[("natural", "water")])));
         assert!(way_is_wanted(&t(&[("water", "lake")])));
+    }
+
+    // Arnis reads a lift's stations off its vertices and builds rides mapped as a single node,
+    // and neither node carries another key the query names.
+    #[test]
+    fn keeps_lift_and_ride_nodes() {
+        assert!(node_is_wanted(&t(&[("aerialway", "pylon")])));
+        assert!(node_is_wanted(&t(&[("aerialway", "station")])));
+        assert!(node_is_wanted(&t(&[("attraction", "carousel")])));
     }
 
     #[test]
