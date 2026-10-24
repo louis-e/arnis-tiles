@@ -238,6 +238,42 @@ A re-bake writes coverage cells itself. Only an archive built before cells exist
 `arnis-tiles cells`, which rescans the files in `out/` (directories only, about a second for the
 planet) and writes cells and on-disk sizes into the index.
 
+### Running it monthly on Modal
+
+`modal_app.py` runs `scripts/bake-and-publish.sh` on [Modal](https://modal.com) at 03:00 Berlin
+time on the 1st of every month. The script is the whole refresh above, unattended: plan, bake,
+upload the archives, switch `archives.json`, purge it from the CDN, then delete every archive that
+neither the new index nor the one it replaced names. A run that fails anywhere uploads no index,
+so clients keep the previous bake. It also refuses an index that lost a continent or more than a
+tenth of the published tiles.
+
+Each run gets a fresh container with an empty disk, which is all a full re-bake needs, and is
+billed only while it runs: one core and 16 GiB, non-preemptible, for a few hours, which the
+Starter plan's monthly credits cover.
+
+One-time setup:
+
+```sh
+pip install modal && modal setup
+modal secret create arnis-tiles-r2 R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=... \
+  R2_ACCOUNT_ID=... CF_API_TOKEN=... CF_ZONE_ID=...
+```
+
+The R2 keys are the bucket-scoped ones from the upload section. `CF_API_TOKEN` is a separate
+token with Zone > Cache Purge > Purge on the zone that serves the archive. Add `HEALTHCHECK_URL`
+to the secret to have a healthchecks.io-style check pinged on start, success and failure; Modal
+itself only keeps the logs.
+
+```sh
+modal run --detach modal_app.py::smoke   # bakes Liechtenstein into smoke-test/, then deletes it
+modal deploy modal_app.py                # schedules the monthly bake
+modal run --detach modal_app.py::bake    # or runs the full one now
+```
+
+The image is built from the local checkout when you deploy, so redeploy from `main` after a
+change lands. Past runs and their logs are under modal.com/apps. A schedule cannot be paused:
+remove it from `modal_app.py` and redeploy, or `modal app stop arnis-tiles`.
+
 ## Testing locally without uploading
 
 PMTiles needs HTTP range requests, which `python3 -m http.server` does not implement. Any
