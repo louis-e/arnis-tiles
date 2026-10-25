@@ -38,8 +38,9 @@ def bake_and_publish(**env: str) -> None:
 
 # Baking is one core plus a download thread and peaks near 5 GB, but writing each continent's
 # archive runs on every core there is: on one core, Europe's and North America's took ten of the
-# first run's thirteen hours. Non-preemptible costs three times as much, but a preempted
-# container restarts the whole planet from nothing.
+# first run's thirteen hours, and on these four (bursting to twenty) eleven minutes.
+# Non-preemptible costs three times as much, but a preempted container restarts the whole planet
+# from nothing.
 @app.function(
     schedule=modal.Cron("0 3 1 * *", timezone="Europe/Berlin"),
     timeout=24 * 60 * 60,
