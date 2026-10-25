@@ -7,9 +7,11 @@
 use crate::format::{self, Tile};
 use crate::store::{ChunkStore, RELATION_X};
 use pmtiles::{PmTilesWriter, TileCoord, TileType};
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// zstd level for published tiles. 19 costs bake time once and saves every download forever.
 const ZSTD_LEVEL: i32 = 19;
@@ -92,6 +94,94 @@ fn merge(blobs: &[Vec<u8>]) -> Result<Tile, String> {
     Ok(out)
 }
 
+/// Tiles per round: enough that every worker stays busy, few enough that a round of dense city
+/// tiles held for the writer stays in the hundreds of megabytes.
+const ROUND: usize = 2048;
+
+/// A merged tile's zstd frame and its size before compression; None for a tile left empty.
+type Packed = Option<(Vec<u8>, u64)>;
+
+/// A reused bulk compressor rather than `encode_all`, which sets up a full-size level-19 context
+/// on every call: 0.8 ms before compressing anything, more than the median tile then takes, and
+/// on ten threads at once four times the CPU in all. Knowing each tile's size also lets zstd fit
+/// its tables to it. The frames decompress to the same bytes and come out about 0.2% larger.
+fn pack(
+    zstd: &mut zstd::bulk::Compressor,
+    stmt: &mut rusqlite::CachedStatement,
+    (x, y): (u32, u32),
+    keep_empty: bool,
+) -> Result<Packed, String> {
+    let blobs: Vec<Vec<u8>> = stmt
+        .query_map(rusqlite::params![x, y], |r| r.get::<_, Vec<u8>>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    let merged = merge(&blobs)?;
+    if merged.is_empty() && !keep_empty {
+        return Ok(None);
+    }
+    let encoded = format::encode(&merged);
+    let packed = zstd.compress(&encoded).map_err(|e| e.to_string())?;
+    Ok(Some((packed, encoded.len() as u64)))
+}
+
+/// Reads, merges and compresses `keys` on one worker per reader connection, handing each result
+/// to `emit` in the order of `keys`, which is the order the PMTiles writer needs.
+///
+/// Done one tile at a time this was most of a run: North America's archive took eight hours on
+/// one core, 3.4 million small records each waiting on its own chunk reads and then its own
+/// compression. Each worker has its own connection so the reads overlap as well, and takes the
+/// next tile as it frees up rather than a fixed share, because Hilbert order clusters a city's
+/// heavy tiles into the same stretch.
+fn pack_all<K: Copy + Sync>(
+    readers: &mut [Connection],
+    keys: &[K],
+    at: impl Fn(K) -> (u32, u32) + Sync,
+    keep_empty: bool,
+    mut emit: impl FnMut(K, Vec<u8>, u64) -> Result<(), String>,
+) -> Result<(), String> {
+    for round in keys.chunks(ROUND) {
+        let next = AtomicUsize::new(0);
+        let done: Vec<Vec<(usize, Packed)>> = std::thread::scope(|s| {
+            let workers: Vec<_> = readers
+                .iter_mut()
+                .map(|conn| {
+                    let (next, at) = (&next, &at);
+                    s.spawn(move || -> Result<Vec<(usize, Packed)>, String> {
+                        let mut stmt = conn
+                            .prepare_cached("SELECT data FROM chunk WHERE x=?1 AND y=?2")
+                            .map_err(|e| e.to_string())?;
+                        let mut zstd =
+                            zstd::bulk::Compressor::new(ZSTD_LEVEL).map_err(|e| e.to_string())?;
+                        let mut mine = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(&k) = round.get(i) else {
+                                return Ok(mine);
+                            };
+                            mine.push((i, pack(&mut zstd, &mut stmt, at(k), keep_empty)?));
+                        }
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().map_err(|_| "finalize worker panicked")?)
+                .collect::<Result<_, String>>()
+        })?;
+        let mut packed: Vec<Packed> = (0..round.len()).map(|_| None).collect();
+        for (i, p) in done.into_iter().flatten() {
+            packed[i] = p;
+        }
+        for (&k, p) in round.iter().zip(packed) {
+            if let Some((bytes, raw)) = p {
+                emit(k, bytes, raw)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn one(
     store: &ChunkStore,
     out_dir: &Path,
@@ -144,36 +234,37 @@ pub fn one(
         .create(file)
         .map_err(|e| e.to_string())?;
 
-    let mut blob_stmt = conn
-        .prepare("SELECT data FROM chunk WHERE x=?1 AND y=?2")
+    // One read-only connection per worker. The store is in WAL mode, so they read side by side.
+    let db = conn.path().ok_or("the chunk store has no file")?;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut readers = (0..threads)
+        .map(|_| Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY))
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
+    eprintln!("  {continent}: {threads} workers");
     let (mut n, mut raw_total, mut comp_total) = (0u64, 0u64, 0u64);
     let mut cells = std::collections::BTreeSet::new();
-    for (_, x, y) in &with_id {
-        let blobs: Vec<Vec<u8>> = blob_stmt
-            .query_map(rusqlite::params![x, y], |r| r.get::<_, Vec<u8>>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())?;
-        let tile = merge(&blobs)?;
-        if tile.is_empty() {
-            continue;
-        }
-        let encoded = format::encode(&tile);
-        let packed = zstd::encode_all(&encoded[..], ZSTD_LEVEL).map_err(|e| e.to_string())?;
-        raw_total += encoded.len() as u64;
-        comp_total += packed.len() as u64;
-        let coord = TileCoord::new(zoom, *x, *y).map_err(|e| e.to_string())?;
-        writer.add_tile(coord, &packed).map_err(|e| e.to_string())?;
-        cells.insert(crate::cells::cell_of(*x, *y, zoom));
-        n += 1;
-        if n % 50_000 == 0 {
-            eprintln!(
-                "  {continent}: {n} tiles, {:.1} GB",
-                comp_total as f64 / 1e9
-            );
-        }
-    }
+    pack_all(
+        &mut readers,
+        &with_id,
+        |(_, x, y)| (x, y),
+        false,
+        |(_, x, y), packed, raw| {
+            raw_total += raw;
+            comp_total += packed.len() as u64;
+            let coord = TileCoord::new(zoom, x, y).map_err(|e| e.to_string())?;
+            writer.add_tile(coord, &packed).map_err(|e| e.to_string())?;
+            cells.insert(crate::cells::cell_of(x, y, zoom));
+            n += 1;
+            if n % 50_000 == 0 {
+                eprintln!(
+                    "  {continent}: {n} tiles, {:.1} GB",
+                    comp_total as f64 / 1e9
+                );
+            }
+            Ok(())
+        },
+    )?;
     // Whole relations after the tiles: their ids sit above every zoom 13 id, so the writer still
     // sees ids in increasing order.
     let mut rel_stmt = conn
@@ -187,26 +278,23 @@ pub fn one(
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
     let mut records = 0u64;
-    for rid in rel_ids {
-        let blobs: Vec<Vec<u8>> = blob_stmt
-            .query_map(rusqlite::params![RELATION_X, rid], |r| {
-                r.get::<_, Vec<u8>>(0)
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())?;
-        let record = merge(&blobs)?;
-        let encoded = format::encode(&record);
-        let packed = zstd::encode_all(&encoded[..], ZSTD_LEVEL).map_err(|e| e.to_string())?;
-        raw_total += encoded.len() as u64;
-        comp_total += packed.len() as u64;
-        let id = pmtiles::TileId::new(format::RELATION_TILE_BASE + u64::from(rid))
-            .map_err(|e| e.to_string())?;
-        writer
-            .add_tile(TileCoord::from(id), &packed)
-            .map_err(|e| e.to_string())?;
-        records += 1;
-    }
+    pack_all(
+        &mut readers,
+        &rel_ids,
+        |rid| (RELATION_X, rid),
+        true,
+        |rid, packed, raw| {
+            raw_total += raw;
+            comp_total += packed.len() as u64;
+            let id = pmtiles::TileId::new(format::RELATION_TILE_BASE + u64::from(rid))
+                .map_err(|e| e.to_string())?;
+            writer
+                .add_tile(TileCoord::from(id), &packed)
+                .map_err(|e| e.to_string())?;
+            records += 1;
+            Ok(())
+        },
+    )?;
     eprintln!("  {continent}: {records} whole relations");
     writer.finalize().map_err(|e| e.to_string())?;
     eprintln!(

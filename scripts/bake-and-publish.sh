@@ -68,7 +68,14 @@ else
 fi
 
 log "plan"
-tiles plan
+# The plan reads openstreetmap.fr as well as Geofabrik. Either being down for an hour should
+# delay a scheduled run, not cancel it until next month.
+for wait in 300 600 1200 2400 4800 0; do
+    tiles plan && break
+    [ "$wait" -gt 0 ] || exit 1
+    log "plan failed; retrying in ${wait}s"
+    sleep "$wait"
+done
 log "run"
 tiles run ${ONLY[@]+"${ONLY[@]}"}
 tiles finalize

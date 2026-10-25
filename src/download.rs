@@ -4,33 +4,44 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long one extract keeps being retried. Over 394 downloads and most of a day a failure is
+/// close to certain - one killed a run 31 regions in ("request or response body error"), and
+/// another 13 hours in, when download.openstreetmap.fr answered 502 to everything for longer
+/// than the 40 seconds of retries it was then given. Waiting out an outage costs a few idle
+/// hours at worst; giving up throws away every hour already baked.
+const PATIENCE: Duration = Duration::from_secs(3 * 60 * 60);
+const MAX_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// `hint` is the size the plan recorded, used only to draw a percentage. It is NOT what the
 /// download is checked against: Geofabrik rebuilds every extract daily, so a plan made
 /// yesterday describes a file that no longer exists, and brazil arriving 344 KB larger than
 /// planned is the archive being fresh, not the download being wrong. Completeness is judged
 /// against the Content-Length of this very response.
-/// Attempts per extract. Over 305 downloads and several hours a transient failure is close to
-/// certain - one killed a run 31 regions in ("request or response body error") - and losing
-/// hours of baking to a blip is not a reasonable failure mode.
-const ATTEMPTS: u32 = 4;
-
 pub fn fetch(url: &str, dir: &Path, hint: u64, quiet: bool) -> Result<PathBuf, String> {
-    let mut last = String::new();
-    for attempt in 1..=ATTEMPTS {
-        match fetch_once(url, dir, hint, quiet) {
+    let started = Instant::now();
+    let mut wait = Duration::from_secs(5);
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let last = match fetch_once(url, dir, hint, quiet) {
             Ok(p) => return Ok(p),
-            Err(e) => {
-                last = e;
-                if attempt < ATTEMPTS {
-                    let wait = 5 * (1 << (attempt - 1));
-                    eprintln!("    download failed ({last}); retrying in {wait}s");
-                    std::thread::sleep(std::time::Duration::from_secs(wait));
-                }
-            }
+            Err(e) => e,
+        };
+        if started.elapsed() + wait > PATIENCE {
+            return Err(format!(
+                "after {attempts} attempts over {} min: {last}",
+                started.elapsed().as_secs() / 60
+            ));
         }
+        eprintln!(
+            "    download failed ({last}); retrying in {}s",
+            wait.as_secs()
+        );
+        std::thread::sleep(wait);
+        wait = (wait * 2).min(MAX_WAIT);
     }
-    Err(format!("after {ATTEMPTS} attempts: {last}"))
 }
 
 /// Host and path, flattened. The basename alone collides: Geofabrik has a `georgia` in Europe
