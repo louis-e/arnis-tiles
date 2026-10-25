@@ -68,13 +68,15 @@ else
 fi
 
 log "plan"
-# The plan reads openstreetmap.fr as well as Geofabrik. Either being down for an hour should
-# delay a scheduled run, not cancel it until next month.
-for wait in 300 600 1200 2400 4800 0; do
-    tiles plan && break
-    [ "$wait" -gt 0 ] || exit 1
+# The plan reads openstreetmap.fr as well as Geofabrik, with nothing cached on a fresh container.
+# Either being down - openstreetmap.fr once was for 7.6 hours - should delay a scheduled run, not
+# cancel it until next month.
+deadline=$((SECONDS + 10 * 3600)) wait=300
+until tiles plan; do
+    [ "$SECONDS" -lt "$deadline" ] || exit 1
     log "plan failed; retrying in ${wait}s"
     sleep "$wait"
+    wait=$((wait * 2 > 3600 ? 3600 : wait * 2))
 done
 log "run"
 tiles run ${ONLY[@]+"${ONLY[@]}"}

@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 /// How long one extract keeps being retried. Over 394 downloads and most of a day a failure is
 /// close to certain - one killed a run 31 regions in ("request or response body error"), and
-/// another 13 hours in, when download.openstreetmap.fr answered 502 to everything for longer
-/// than the 40 seconds of retries it was then given. Waiting out an outage costs a few idle
-/// hours at worst; giving up throws away every hour already baked.
-const PATIENCE: Duration = Duration::from_secs(3 * 60 * 60);
+/// another 13 hours in, when download.openstreetmap.fr answered 502 to everything for 7.6
+/// hours against the 40 seconds of retries it was then given. Waiting out an outage costs idle
+/// hours; giving up throws away every hour already baked, and a run takes well under the other
+/// 14 of Modal's 24.
+const PATIENCE: Duration = Duration::from_secs(10 * 60 * 60);
 const MAX_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// `hint` is the size the plan recorded, used only to draw a percentage. It is NOT what the

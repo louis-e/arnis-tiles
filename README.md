@@ -249,8 +249,8 @@ tenth of the published tiles.
 
 Each run gets a fresh container with an empty disk, which is all a full re-bake needs, and is
 billed only while it runs: four cores and 16 GiB, non-preemptible, for several hours, which the
-Starter plan's monthly credits cover. Downloads and the plan are retried for hours rather than
-seconds, so an outage at Geofabrik or openstreetmap.fr delays a run instead of failing it.
+Starter plan's monthly credits cover. Downloads and the plan are retried for up to ten hours,
+so an outage at Geofabrik or openstreetmap.fr delays a run instead of failing it.
 
 One-time setup:
 
