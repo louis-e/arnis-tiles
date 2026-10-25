@@ -248,8 +248,10 @@ so clients keep the previous bake. It also refuses an index that lost a continen
 tenth of the published tiles.
 
 Each run gets a fresh container with an empty disk, which is all a full re-bake needs, and is
-billed only while it runs: one core and 16 GiB, non-preemptible, for a few hours, which the
-Starter plan's monthly credits cover.
+billed only while it runs: four cores and 16 GiB, non-preemptible. The first complete run took
+5 h 44 min and cost $9.76, of which $3.80 was Modal's egress charge for the ~105 GB upload to R2;
+the Starter plan's monthly credits cover it. Downloads and the plan are retried for up to ten hours,
+so an outage at Geofabrik or openstreetmap.fr delays a run instead of failing it.
 
 One-time setup:
 
