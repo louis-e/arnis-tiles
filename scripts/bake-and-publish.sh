@@ -11,6 +11,8 @@
 # Optional:
 #   BUCKET (arnis-tiles), PREFIX (v1), PUBLIC_BASE (https://tiles.arnisproject.com)
 #   HEALTHCHECK_URL   pinged at start, on success and on failure (healthchecks.io style)
+#   DEADLINE          Unix time the host kills this run at; the bake gives up early if it would
+#                     not leave the upload two hours before then
 #   SMOKE=1           bake Liechtenstein only, publish it under smoke-test/, then delete that
 
 set -euo pipefail
@@ -21,10 +23,13 @@ BUCKET="${BUCKET:-arnis-tiles}"
 PREFIX="${PREFIX:-v1}"
 PUBLIC_BASE="${PUBLIC_BASE:-https://tiles.arnisproject.com}"
 SMOKE="${SMOKE:-}"
-ONLY=()
+RUN=()
 if [ -n "$SMOKE" ]; then
     PREFIX=smoke-test
-    ONLY=(--only liechtenstein)
+    RUN=(--only liechtenstein)
+fi
+if [ -n "${DEADLINE:-}" ]; then
+    RUN+=(--finish-by "$((DEADLINE - 2 * 3600))")
 fi
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
@@ -79,7 +84,7 @@ until tiles plan; do
     wait=$((wait * 2 > 3600 ? 3600 : wait * 2))
 done
 log "run"
-tiles run ${ONLY[@]+"${ONLY[@]}"}
+tiles run ${RUN[@]+"${RUN[@]}"}
 tiles finalize
 INDEX="$OUT/archives.json"
 
