@@ -53,6 +53,11 @@ enum Cmd {
         /// Keep each .pbf instead of deleting it after baking.
         #[arg(long)]
         keep_pbf: bool,
+        /// Unix time this run has to be done by. Once a tenth of it is baked, it gives up as
+        /// soon as its pace so far would miss that: a host that kills the run at a deadline
+        /// bills for every hour up to it and gets nothing published.
+        #[arg(long)]
+        finish_by: Option<u64>,
     },
     /// Publish any continent whose chunk store is still on disk. `run` already does this as
     /// each continent completes; this is for finishing an interrupted run.
@@ -310,7 +315,11 @@ fn real_main() -> Result<(), String> {
             println!("plan written to {}", plan_path(&cli.work).display());
         }
 
-        Cmd::Run { only, keep_pbf } => {
+        Cmd::Run {
+            only,
+            keep_pbf,
+            finish_by,
+        } => {
             let p = load_plan(&cli.work)?;
             let pbf_dir = cli.work.join("pbf");
             let mut stores: HashMap<String, store::ChunkStore> = HashMap::new();
@@ -340,6 +349,9 @@ fn real_main() -> Result<(), String> {
                 )
             });
             let total = todo.len();
+            let started = std::time::Instant::now();
+            let mut left: u64 = todo.iter().map(|r| r.bytes).sum();
+            let mut baked: u64 = 0;
             // The bake is CPU-bound and the download is not, so the next extract is fetched
             // while the current one bakes. Serially this run is download + bake; overlapped it
             // is roughly the slower of the two.
@@ -404,6 +416,32 @@ fn real_main() -> Result<(), String> {
                         }
                     }
                     bake_into(st, r, &path, p.zoom, keep_pbf)?;
+                    baked += r.bytes;
+                }
+                left -= r.bytes;
+
+                // Downloads set the pace: on 1 November 2026 Geofabrik served 0.65 MB/s against
+                // over 4 a week earlier, which would have run 12 hours past Modal's timeout.
+                if let Some(deadline) = finish_by {
+                    if !already && left > 0 && baked * 10 >= baked + left {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+                        let spent = started.elapsed().as_secs_f64();
+                        let need = spent * left as f64 / baked as f64;
+                        if now as f64 + need > deadline as f64 {
+                            return Err(format!(
+                                "giving up: {:.1} GB took {:.1} h ({:.2} MB/s), so the {:.1} GB \
+                                 left need another {:.1} h, and the deadline is {:.1} h away",
+                                baked as f64 / 1e9,
+                                spent / 3600.0,
+                                baked as f64 / 1e6 / spent,
+                                left as f64 / 1e9,
+                                need / 3600.0,
+                                (deadline as f64 - now as f64) / 3600.0
+                            ));
+                        }
+                    }
                 }
 
                 // Last region of this continent? Publish it now and give the disk back.

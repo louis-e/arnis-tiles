@@ -240,18 +240,23 @@ planet) and writes cells and on-disk sizes into the index.
 
 ### Running it monthly on Modal
 
-`modal_app.py` runs `scripts/bake-and-publish.sh` on [Modal](https://modal.com) at 03:00 Berlin
-time on the 1st of every month. The script is the whole refresh above, unattended: plan, bake,
-upload the archives, switch `archives.json`, purge it from the CDN, then delete every archive that
-neither the new index nor the one it replaced names. A run that fails anywhere uploads no index,
-so clients keep the previous bake. It also refuses an index that lost a continent or more than a
-tenth of the published tiles.
+`modal_app.py` runs `scripts/bake-and-publish.sh` on [Modal](https://modal.com) at 03:41 Berlin
+time on the 23rd of every month. Not on the 1st: on 1 November 2026 Geofabrik served each
+connection a tenth of its usual speed, presumably because every monthly job downloads then. The
+script is the whole refresh above, unattended: plan, bake, upload the archives, switch
+`archives.json`, purge it from the CDN, then delete every archive that neither the new index nor
+the one it replaced names. A run that fails anywhere uploads no index, so clients keep the
+previous bake. It also refuses an index that lost a continent or more than a tenth of the
+published tiles.
 
 Each run gets a fresh container with an empty disk, which is all a full re-bake needs, and is
 billed only while it runs: four cores and 16 GiB, non-preemptible. The first complete run took
 5 h 44 min and cost $9.76, of which $3.80 was Modal's egress charge for the ~105 GB upload to R2;
 the Starter plan's monthly credits cover it. Downloads and the plan are retried for up to ten hours,
-so an outage at Geofabrik or openstreetmap.fr delays a run instead of failing it.
+so an outage at Geofabrik or openstreetmap.fr delays a run instead of failing it. A run that is
+merely slow is another matter: Modal kills it after 24 hours, so once a tenth is baked it gives up
+as soon as its pace would leave the upload less than two hours; the November 2026 run would
+have needed about 36.
 
 One-time setup:
 

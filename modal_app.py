@@ -2,10 +2,11 @@
 
     modal run --detach modal_app.py::smoke   # Liechtenstein only, published under smoke-test/
     modal run --detach modal_app.py::bake    # a full bake and publish, now
-    modal deploy modal_app.py                # the same full bake on the 1st of every month
+    modal deploy modal_app.py                # the same full bake on the 23rd of every month
 """
 
 import subprocess
+import time
 
 import modal
 
@@ -24,6 +25,7 @@ image = (
 
 app = modal.App("arnis-tiles", image=image)
 secrets = [modal.Secret.from_name("arnis-tiles-r2")]
+TIMEOUT = 24 * 60 * 60
 
 
 def bake_and_publish(**env: str) -> None:
@@ -41,16 +43,21 @@ def bake_and_publish(**env: str) -> None:
 # first run's thirteen hours, and on these four (bursting to twenty) eleven minutes.
 # Non-preemptible costs three times as much, but a preempted container restarts the whole planet
 # from nothing.
+#
+# Not on the 1st: on 1 November 2026 Geofabrik gave each connection 0.3-0.6 MB/s, a tenth of what
+# it served on 24 and 25 October, presumably because every monthly job downloads then. The 23rd
+# is late enough to avoid that, and early enough that no month is too short for it; the odd
+# minute steps around jobs that start on the hour.
 @app.function(
-    schedule=modal.Cron("0 3 1 * *", timezone="Europe/Berlin"),
-    timeout=24 * 60 * 60,
+    schedule=modal.Cron("41 3 23 * *", timezone="Europe/Berlin"),
+    timeout=TIMEOUT,
     cpu=4.0,
     memory=16 * 1024,
     nonpreemptible=True,
     secrets=secrets,
 )
 def bake() -> None:
-    bake_and_publish()
+    bake_and_publish(DEADLINE=str(int(time.time()) + TIMEOUT))
 
 
 @app.function(timeout=60 * 60, cpu=1.0, memory=4 * 1024, secrets=secrets)
