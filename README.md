@@ -40,10 +40,12 @@ Everything Arnis renders from, and nothing else:
   touch it; Arnis fetches the whole relation when a bbox gets part of one, which is what
   Overpass's `way(r.relsinbbox)` returned
 * every tag on them except what `osm_parser.rs` already throws away (names, `addr:*` except the
-  house number, wikipedia, operator, website, opening hours, source)
+  house number, operator, website, opening hours, source)
 
 So `building:levels`, `height`, `roof:shape`, `roof:material`, `building:colour` and `start_date`
-all survive. The way filter is deliberately "anything tagged" rather than a key list, because a
+all survive. So do `source`, `source:geometry`, `source:outline` and `ref:bag`, on buildings and
+building parts only: they tell an outline surveyed by a cadastre from one traced from the air.
+`wikipedia` is kept without its value, since Arnis only asks whether an article exists. The way filter is deliberately "anything tagged" rather than a key list, because a
 key list kept silently dropping tags that Arnis renders through less obvious paths
 (`area:aeroway`, `service=siding`, `ruins:building` and others).
 

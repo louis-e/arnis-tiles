@@ -42,7 +42,6 @@ const IGNORED_TAGS: &[&str] = &[
     "FIXME",
     "todo",
     "TODO",
-    "wikipedia",
     "wikimedia_commons",
     "import_uuid",
     "import",
@@ -85,13 +84,39 @@ const IGNORED_PREFIXES: &[&str] = &[
     "check_date:",
 ];
 
+/// Kept on buildings and building parts only, against the `source` prefix and `ref:bag` above:
+/// where an outline came from tells a surveyed wall line (a cadastre, the Dutch BAG) from a
+/// roof traced from the air, and Arnis hangs the eaves accordingly.
+const BUILDING_OUTLINE_SOURCE: &[&str] =
+    &["source", "source:geometry", "source:outline", "ref:bag"];
+
 /// `start_date` is kept: Arnis picks a facade style from a building's construction year.
-/// `addr:housenumber` is kept: it feeds the door plate.
-pub fn keep_tag(k: &str) -> bool {
-    if k == "addr:housenumber" || k == "start_date" || k == "type" {
+/// `addr:housenumber` is kept: it feeds the door plate. `wikipedia` is kept, but see `filter`.
+fn keep_tag(k: &str, building: bool) -> bool {
+    if k == "addr:housenumber" || k == "start_date" || k == "type" || k == "wikipedia" {
+        return true;
+    }
+    if building && BUILDING_OUTLINE_SOURCE.contains(&k) {
         return true;
     }
     !IGNORED_TAGS.contains(&k) && !IGNORED_PREFIXES.iter().any(|p| k.starts_with(p))
+}
+
+/// The tags of one element that the archive carries. Whether it is a building is decided from
+/// all of its tags, as `filter_tags` in osm_parser.rs does.
+pub fn filter<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<(String, String)> {
+    let tags: Vec<(&str, &str)> = tags.collect();
+    let building = tags
+        .iter()
+        .any(|(k, _)| *k == "building" || *k == "building:part");
+    tags.into_iter()
+        .filter(|(k, _)| keep_tag(k, building))
+        .map(|(k, v)| {
+            // Discoveries only ask whether an article exists, so Arnis empties the value anyway.
+            let v = if k == "wikipedia" { "" } else { v };
+            (k.to_string(), v.to_string())
+        })
+        .collect()
 }
 
 fn get<'a>(tags: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -229,17 +254,67 @@ mod tests {
         assert!(!way_is_wanted(&[]));
     }
 
-    // The tag filter must match osm_parser.rs, including its two deliberate exceptions.
+    fn kept(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        filter(pairs.iter().copied())
+    }
+
+    // The tag filter must match osm_parser.rs, including its deliberate exceptions.
     #[test]
     fn tag_filter_matches_arnis() {
-        assert!(!keep_tag("name:de"));
-        assert!(!keep_tag("addr:street"));
-        assert!(!keep_tag("source"));
-        assert!(!keep_tag("website"));
-        assert!(keep_tag("addr:housenumber"));
-        assert!(keep_tag("start_date"));
-        assert!(keep_tag("building:levels"));
-        assert!(keep_tag("roof:shape"));
-        assert!(keep_tag("height"));
+        for building in [false, true] {
+            assert!(!keep_tag("name:de", building));
+            assert!(!keep_tag("addr:street", building));
+            assert!(!keep_tag("website", building));
+            assert!(!keep_tag("source:date", building));
+            assert!(!keep_tag("ref:bygningsnr", building));
+            assert!(keep_tag("addr:housenumber", building));
+            assert!(keep_tag("start_date", building));
+            assert!(keep_tag("wikipedia", building));
+            assert!(keep_tag("building:levels", building));
+            assert!(keep_tag("roof:shape", building));
+            assert!(keep_tag("height", building));
+        }
+    }
+
+    // A Dutch building as the BAG import maps it: everything but the date of the source stays.
+    #[test]
+    fn a_building_keeps_where_its_outline_came_from() {
+        let tags = kept(&[
+            ("building", "house"),
+            ("source", "BAG"),
+            ("source:date", "2014-03-24"),
+            ("ref:bag", "363100012345678"),
+            ("start_date", "1931"),
+        ]);
+        assert_eq!(
+            tags,
+            t(&[
+                ("building", "house"),
+                ("source", "BAG"),
+                ("ref:bag", "363100012345678"),
+                ("start_date", "1931"),
+            ])
+        );
+        for key in ["source:geometry", "source:outline"] {
+            let part = kept(&[("building:part", "yes"), (key, "cadastre-dgi-fr")]);
+            assert!(part.iter().any(|(k, _)| k == key), "{key} was dropped");
+        }
+    }
+
+    #[test]
+    fn nothing_else_keeps_a_source() {
+        let road = kept(&[
+            ("highway", "residential"),
+            ("source", "Bing"),
+            ("source:geometry", "survey"),
+            ("ref:bag", "1"),
+        ]);
+        assert_eq!(road, t(&[("highway", "residential")]));
+    }
+
+    #[test]
+    fn wikipedia_is_kept_without_its_value() {
+        let tags = kept(&[("tourism", "museum"), ("wikipedia", "nl:Rijksmuseum")]);
+        assert_eq!(tags, t(&[("tourism", "museum"), ("wikipedia", "")]));
     }
 }
