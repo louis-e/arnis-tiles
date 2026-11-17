@@ -189,11 +189,7 @@ pub fn bake(
     open()?
         .for_each(|el| {
             if let Element::Relation(r) = el {
-                let t: Vec<(String, String)> = r
-                    .tags()
-                    .filter(|(k, _)| tags::keep_tag(k))
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
+                let t: Vec<(String, String)> = tags::filter(r.tags());
                 if !tags::relation_is_wanted(&t) {
                     return;
                 }
@@ -255,19 +251,11 @@ pub fn bake(
     open()?
         .for_each(|el| match el {
             Element::Node(n) => {
-                let t = n
-                    .tags()
-                    .filter(|(k, _)| tags::keep_tag(k))
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
+                let t = tags::filter(n.tags());
                 handle_node(n.id(), n.lat(), n.lon(), t);
             }
             Element::DenseNode(n) => {
-                let t = n
-                    .tags()
-                    .filter(|(k, _)| tags::keep_tag(k))
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
+                let t = tags::filter(n.tags());
                 handle_node(n.id(), n.lat(), n.lon(), t);
             }
             _ => {}
@@ -293,11 +281,7 @@ pub fn bake(
     open()?
         .for_each(|el| {
             let Element::Way(w) = el else { return };
-            let t: Vec<(String, String)> = w
-                .tags()
-                .filter(|(k, _)| tags::keep_tag(k))
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
+            let t: Vec<(String, String)> = tags::filter(w.tags());
             let is_member = member_ways.contains(&w.id());
             if !is_member && !tags::way_is_wanted(&t) {
                 return;
