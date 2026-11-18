@@ -45,7 +45,10 @@ Everything Arnis renders from, and nothing else:
 So `building:levels`, `height`, `roof:shape`, `roof:material`, `building:colour` and `start_date`
 all survive. So do `source`, `source:geometry`, `source:outline` and `ref:bag`, on buildings and
 building parts only: they tell an outline surveyed by a cadastre from one traced from the air.
-`wikipedia` is kept without its value, since Arnis only asks whether an article exists. The way filter is deliberately "anything tagged" rather than a key list, because a
+For the same reason buildings keep `ref:ruian:building` and `ref:bygningsnr` without their value,
+and a `source:geometry:ref` naming a Flemish GRB object cut to its `Gbg/` or `Gba/` prefix: Arnis
+reads no more of them. `wikipedia` is kept without its value, since Arnis only asks whether an
+article exists. The way filter is deliberately "anything tagged" rather than a key list, because a
 key list kept silently dropping tags that Arnis renders through less obvious paths
 (`area:aeroway`, `service=siding`, `ruins:building` and others).
 

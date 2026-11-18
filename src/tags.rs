@@ -90,16 +90,41 @@ const IGNORED_PREFIXES: &[&str] = &[
 const BUILDING_OUTLINE_SOURCE: &[&str] =
     &["source", "source:geometry", "source:outline", "ref:bag"];
 
+/// A Czech RUIAN or Norwegian cadastre building number says the same, and is kept on buildings
+/// too. Arnis only asks whether one is there, so its value is emptied.
+const BUILDING_REGISTER_REFS: &[&str] = &["ref:ruian:building", "ref:bygningsnr"];
+
+/// The prefix of a Flemish GRB building (`Gbg/`) or annex (`Gba/`) in a `source:geometry:ref`:
+/// an outline surveyed at its walls. Arnis reads nothing past it.
+fn grb_prefix(value: &str) -> Option<&'static str> {
+    ["Gbg/", "Gba/"]
+        .into_iter()
+        .find(|p| value.trim_start().starts_with(p))
+}
+
+/// The value the archive stores for one tag, or `None` to drop the tag.
+///
 /// `start_date` is kept: Arnis picks a facade style from a building's construction year.
-/// `addr:housenumber` is kept: it feeds the door plate. `wikipedia` is kept, but see `filter`.
-fn keep_tag(k: &str, building: bool) -> bool {
-    if k == "addr:housenumber" || k == "start_date" || k == "type" || k == "wikipedia" {
-        return true;
+/// `addr:housenumber` is kept: it feeds the door plate.
+fn kept_value<'a>(k: &str, v: &'a str, building: bool) -> Option<&'a str> {
+    if building {
+        if BUILDING_OUTLINE_SOURCE.contains(&k) {
+            return Some(v);
+        }
+        if BUILDING_REGISTER_REFS.contains(&k) {
+            return Some("");
+        }
+        if k == "source:geometry:ref" {
+            return grb_prefix(v);
+        }
     }
-    if building && BUILDING_OUTLINE_SOURCE.contains(&k) {
-        return true;
+    match k {
+        "addr:housenumber" | "start_date" | "type" => Some(v),
+        // Discoveries only ask whether an article exists, so Arnis empties the value anyway.
+        "wikipedia" => Some(""),
+        _ if IGNORED_TAGS.contains(&k) || IGNORED_PREFIXES.iter().any(|p| k.starts_with(p)) => None,
+        _ => Some(v),
     }
-    !IGNORED_TAGS.contains(&k) && !IGNORED_PREFIXES.iter().any(|p| k.starts_with(p))
 }
 
 /// The tags of one element that the archive carries. Whether it is a building is decided from
@@ -110,12 +135,7 @@ pub fn filter<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<(String
         .iter()
         .any(|(k, _)| *k == "building" || *k == "building:part");
     tags.into_iter()
-        .filter(|(k, _)| keep_tag(k, building))
-        .map(|(k, v)| {
-            // Discoveries only ask whether an article exists, so Arnis empties the value anyway.
-            let v = if k == "wikipedia" { "" } else { v };
-            (k.to_string(), v.to_string())
-        })
+        .filter_map(|(k, v)| kept_value(k, v, building).map(|v| (k.to_string(), v.to_string())))
         .collect()
 }
 
@@ -261,18 +281,20 @@ mod tests {
     // The tag filter must match osm_parser.rs, including its deliberate exceptions.
     #[test]
     fn tag_filter_matches_arnis() {
+        let keep = |k, building| kept_value(k, "x", building).is_some();
         for building in [false, true] {
-            assert!(!keep_tag("name:de", building));
-            assert!(!keep_tag("addr:street", building));
-            assert!(!keep_tag("website", building));
-            assert!(!keep_tag("source:date", building));
-            assert!(!keep_tag("ref:bygningsnr", building));
-            assert!(keep_tag("addr:housenumber", building));
-            assert!(keep_tag("start_date", building));
-            assert!(keep_tag("wikipedia", building));
-            assert!(keep_tag("building:levels", building));
-            assert!(keep_tag("roof:shape", building));
-            assert!(keep_tag("height", building));
+            assert!(!keep("name:de", building));
+            assert!(!keep("addr:street", building));
+            assert!(!keep("website", building));
+            assert!(!keep("source:date", building));
+            assert!(!keep("ref:ruian:addr", building));
+            assert!(!keep("building:ruian:type", building));
+            assert!(keep("addr:housenumber", building));
+            assert!(keep("start_date", building));
+            assert!(keep("wikipedia", building));
+            assert!(keep("building:levels", building));
+            assert!(keep("roof:shape", building));
+            assert!(keep("height", building));
         }
     }
 
@@ -301,13 +323,44 @@ mod tests {
         }
     }
 
+    // Czech and Norwegian buildings carry their cadastre number, Flemish ones the GRB object
+    // their outline was surveyed as. Arnis reads no more of the value than is kept here.
+    #[test]
+    fn a_building_keeps_its_cadastre_reference() {
+        let czech = kept(&[
+            ("building", "yes"),
+            ("ref:ruian:building", "21642028"),
+            ("ref:ruian:addr", "25959751"),
+            ("building:ruian:type", "6"),
+        ]);
+        assert_eq!(czech, t(&[("building", "yes"), ("ref:ruian:building", "")]));
+        let norwegian = kept(&[("building", "house"), ("ref:bygningsnr", "18537581")]);
+        assert_eq!(
+            norwegian,
+            t(&[("building", "house"), ("ref:bygningsnr", "")])
+        );
+        for (value, prefix) in [("Gbg/1234567/2", "Gbg/"), (" Gba/76543/1", "Gba/")] {
+            let flemish = kept(&[("building:part", "yes"), ("source:geometry:ref", value)]);
+            assert_eq!(
+                flemish,
+                t(&[("building:part", "yes"), ("source:geometry:ref", prefix)])
+            );
+        }
+        // Any other survey reference says nothing Arnis reads.
+        let other = kept(&[("building", "yes"), ("source:geometry:ref", "Picc/42")]);
+        assert_eq!(other, t(&[("building", "yes")]));
+    }
+
     #[test]
     fn nothing_else_keeps_a_source() {
         let road = kept(&[
             ("highway", "residential"),
             ("source", "Bing"),
             ("source:geometry", "survey"),
+            ("source:geometry:ref", "Gbg/1234567/2"),
             ("ref:bag", "1"),
+            ("ref:ruian:building", "2"),
+            ("ref:bygningsnr", "3"),
         ]);
         assert_eq!(road, t(&[("highway", "residential")]));
     }
