@@ -240,30 +240,32 @@ fn box_ring(w: f64, s: f64, e: f64, n: f64) -> Edge {
 /// their side). Every extract carries a bounding box in its header, and the header sits at the
 /// front of the file, so one range request buys a shape. It is only a box, though, so the plan
 /// never lets it vouch for land a real polygon could cover.
-fn header_bbox(url: &str) -> Option<(f64, f64, f64, f64)> {
+///
+/// An error means the header could not be read. `None` means it was read and has no box.
+fn header_bbox(url: &str) -> Result<Option<(f64, f64, f64, f64)>, String> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(120))
         .build()
-        .ok()?;
+        .map_err(|e| e.to_string())?;
     let resp = client
         .get(url)
         .header("Range", "bytes=0-65535")
         .send()
-        .ok()?;
+        .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return None;
+        return Err(format!("{} for {url}", resp.status()));
     }
-    let body = resp.bytes().ok()?;
+    let body = resp.bytes().map_err(|e| e.to_string())?;
     let reader = osmpbf::BlobReader::new(std::io::Cursor::new(body.to_vec()));
     for blob in reader {
-        let Ok(blob) = blob else { return None };
+        // The range cuts the file short, so a blob that fails to read is the end of it.
+        let Ok(blob) = blob else { return Ok(None) };
         if let Ok(osmpbf::BlobDecode::OsmHeader(h)) = blob.decode() {
-            let b = h.bbox()?;
-            return Some((b.left, b.bottom, b.right, b.top));
+            return Ok(h.bbox().map(|b| (b.left, b.bottom, b.right, b.top)));
         }
     }
-    None
+    Ok(None)
 }
 
 pub(crate) fn http_get(url: &str) -> Result<Vec<u8>, String> {
@@ -279,17 +281,85 @@ pub(crate) fn http_get(url: &str) -> Result<Vec<u8>, String> {
     Ok(resp.bytes().map_err(|e| e.to_string())?.to_vec())
 }
 
-fn content_length(client: &reqwest::blocking::Client, url: &str) -> Option<u64> {
-    let resp = client.head(url).send().ok()?;
+/// The size of `url`, or why there is none. The error names the URL.
+fn content_length(client: &reqwest::blocking::Client, url: &str) -> Result<u64, String> {
+    // reqwest's own errors already name the URL.
+    let resp = client.head(url).send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return None;
+        return Err(format!("{} for {url}", resp.status()));
     }
     resp.headers()
-        .get(reqwest::header::CONTENT_LENGTH)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse().ok())
+        .ok_or_else(|| format!("no Content-Length for {url}"))
+}
+
+/// Every extract's size, by id, or an error if any of them has none.
+///
+/// An extract without a size can be neither picked nor ruled out, so the plan stops instead.
+/// Leaving them out cost the 23 Nov 2026 run all but 12 of its regions: Geofabrik had just moved
+/// every extract into a folder of its own, almost every HEAD failed, and the plan went on without
+/// Europe, Asia or Russia.
+fn fetch_sizes(extracts: &[(&Feature, String)]) -> Result<HashMap<String, u64>, String> {
+    /// This many failures in a row is an outage, not a few bad files, and waiting out the
+    /// timeout on all the rest would only delay the retry.
+    const GIVE_UP_AFTER: usize = 20;
+    eprintln!(
+        "HEADing {} extracts for their sizes (once; cached)",
+        extracts.len()
+    );
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut sizes: HashMap<String, u64> = HashMap::new();
+    let mut failed: Vec<(&Feature, &str)> = Vec::new();
+    let mut in_a_row = 0;
+    for (i, (f, url)) in extracts.iter().enumerate() {
+        match content_length(&client, url) {
+            Ok(n) => {
+                sizes.insert(f.properties.id.clone(), n);
+                in_a_row = 0;
+            }
+            Err(e) => {
+                failed.push((f, url));
+                in_a_row += 1;
+                if in_a_row >= GIVE_UP_AFTER {
+                    return Err(format!(
+                        "the last {in_a_row} extracts all have no size, e.g. {}: {e}",
+                        f.properties.id
+                    ));
+                }
+            }
+        }
+        if i % 50 == 0 {
+            eprintln!("  {i}/{}", extracts.len());
+        }
+    }
+    if failed.is_empty() {
+        return Ok(sizes);
+    }
+    eprintln!("  {} gave no size; asking again in 30s", failed.len());
+    std::thread::sleep(std::time::Duration::from_secs(30));
+    let mut errors = Vec::new();
+    for (f, url) in failed {
+        match content_length(&client, url) {
+            Ok(n) => {
+                sizes.insert(f.properties.id.clone(), n);
+            }
+            Err(e) => errors.push(format!("{}: {e}", f.properties.id)),
+        }
+    }
+    if errors.is_empty() {
+        return Ok(sizes);
+    }
+    Err(format!(
+        "{} of {} extracts have no size, e.g. {}",
+        errors.len(),
+        extracts.len(),
+        errors[..errors.len().min(3)].join("; ")
+    ))
 }
 
 pub(crate) fn cached(
@@ -479,28 +549,19 @@ fn load_shapes(cache: &Path) -> Result<(Vec<Shape>, Ring), String> {
         .filter_map(|f| f.properties.urls.get("pbf").map(|u| (f, u.clone())))
         .collect();
 
+    // Failing to read sizes or headers may mean the index names URLs that have since moved, as
+    // they all did in November 2026, so the next attempt fetches the index again.
+    let forget_index = |e: String| {
+        let _ = std::fs::remove_file(cache.join("index-v1.json"));
+        e
+    };
+
     // Sizes: one HEAD per extract, cached, because the index carries none.
     let sizes_raw = cached(cache, "sizes.json", || {
-        eprintln!(
-            "HEADing {} extracts for their sizes (once; cached)",
-            with_pbf.len()
-        );
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut map: HashMap<String, u64> = HashMap::new();
-        for (i, (f, url)) in with_pbf.iter().enumerate() {
-            if let Some(n) = content_length(&client, url) {
-                map.insert(f.properties.id.clone(), n);
-            }
-            if i % 50 == 0 {
-                eprintln!("  {i}/{}", with_pbf.len());
-            }
-        }
-        serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())
-    })?;
+        let sizes = fetch_sizes(&with_pbf)?;
+        serde_json::to_vec_pretty(&sizes).map_err(|e| e.to_string())
+    })
+    .map_err(forget_index)?;
     let sizes: HashMap<String, u64> =
         serde_json::from_slice(&sizes_raw).map_err(|e| e.to_string())?;
 
@@ -515,7 +576,9 @@ fn load_shapes(cache: &Path) -> Result<(Vec<Shape>, Ring), String> {
         );
         let mut map: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
         for (f, url) in missing {
-            match header_bbox(url) {
+            // Only a header that has no box may leave an extract out; a failed read stops the
+            // plan, as a missing size does.
+            match header_bbox(url).map_err(|e| format!("{}: {e}", f.properties.id))? {
                 Some(b) => {
                     eprintln!("  {} -> {:?}", f.properties.id, b);
                     map.insert(f.properties.id.clone(), b);
@@ -527,7 +590,8 @@ fn load_shapes(cache: &Path) -> Result<(Vec<Shape>, Ring), String> {
             }
         }
         serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())
-    })?;
+    })
+    .map_err(forget_index)?;
     let headers: HashMap<String, (f64, f64, f64, f64)> =
         serde_json::from_slice(&headers_raw).map_err(|e| e.to_string())?;
 
@@ -559,11 +623,17 @@ fn load_shapes(cache: &Path) -> Result<(Vec<Shape>, Ring), String> {
             rings = vec![box_ring(w, s, e, n)];
             kind = Kind::HeaderBox;
         }
+        let bytes = sizes.get(id).copied().ok_or_else(|| {
+            format!(
+                "{id} has no size in {}; delete it and index-v1.json beside it to ask again",
+                cache.join("sizes.json").display()
+            )
+        })?;
         shapes.push(Shape {
             id: id.clone(),
             name: f.properties.name.clone(),
             url: url.clone(),
-            bytes: sizes.get(id).copied().unwrap_or(u64::MAX),
+            bytes,
             continent: continent_of(id),
             kind,
             rings,
@@ -586,9 +656,8 @@ fn load_shapes(cache: &Path) -> Result<(Vec<Shape>, Ring), String> {
         let mut map: HashMap<String, u64> = HashMap::new();
         for s in &supplements {
             let url = format!("{OSMFR_EXTRACTS}/{}-latest.osm.pbf", s.path);
-            if let Some(n) = content_length(&client, &url) {
-                map.insert(s.id.clone(), n);
-            }
+            let n = content_length(&client, &url).map_err(|e| format!("{}: {e}", s.id))?;
+            map.insert(s.id.clone(), n);
         }
         serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())
     })?;

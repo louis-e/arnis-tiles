@@ -77,9 +77,9 @@ satellite land cover). Coordinates keep OSM's own 1e-7 degrees.
 cargo build --release
 
 # 1. Work out which extracts cover the world. Writes work/plan.json and lists any land it
-#    cannot reach. The first run HEADs every extract for its size, range-reads the headers of
-#    the few with no cutting polygon and fetches Natural Earth's land polygons; all of it is
-#    cached under cache/.
+#    cannot reach. The first run HEADs every extract for its size (and stops if one gives
+#    none), range-reads the headers of the few with no cutting polygon and fetches Natural
+#    Earth's land polygons; all of it is cached under cache/.
 ./target/release/arnis-tiles plan
 
 # 2. Download, bake and delete each extract in turn. Resumable: rerun after any interruption
@@ -224,7 +224,8 @@ whose coverage cells intersect the bbox, and falls back to Overpass on any error
 ## Keeping it fresh
 
 A tile is only as fresh as the extract it came from. Geofabrik rebuilds daily, so a weekly
-re-bake keeps the archive within a week of live OSM. Delete `cache/sizes.json` so `plan` re-reads
+re-bake keeps the archive within a week of live OSM. Delete `cache/index-v1.json`,
+`cache/sizes.json` and `cache/header-bboxes.json` so `plan` reads Geofabrik's current index and
 sizes, then `run` against an empty chunk store, then `finalize`.
 
 Published archives carry the time they were built (`europe-20261018-142233.pmtiles`) and are
@@ -255,13 +256,22 @@ previous bake. It also refuses an index that lost a continent or more than a ten
 published tiles.
 
 Each run gets a fresh container with an empty disk, which is all a full re-bake needs, and is
-billed only while it runs: four cores and 16 GiB, non-preemptible. The first complete run took
-5 h 44 min and cost $9.76, of which $3.80 was Modal's egress charge for the ~105 GB upload to R2;
-the Starter plan's monthly credits cover it. Downloads and the plan are retried for up to ten hours,
-so an outage at Geofabrik or openstreetmap.fr delays a run instead of failing it. A run that is
-merely slow is another matter: Modal kills it after 24 hours, so once a tenth is baked it gives up
-as soon as its pace would leave the upload less than two hours; the November 2026 run would
-have needed about 36.
+billed only while it runs: four cores and 16 GiB, non-preemptible. Modal lets the container use up
+to 16 more cores while they are free, and bills only what is used. Since November 2026 the bake
+decodes each extract on up to 16 cores. Until then it decoded on one, at about 5 MB/s of `.pbf`, a
+tenth of what Geofabrik serves there, and that pace set the length of the run. The first complete
+run took 5 h 44 min and cost $9.76, of which $3.80 was Modal's egress charge for the ~105 GB upload
+to R2; the Starter plan's monthly credits cover it.
+
+Downloads and the plan are retried for up to ten hours, so an outage at Geofabrik or
+openstreetmap.fr delays a run instead of failing it. An extract the plan cannot get a size for
+counts as such an outage. On 23 November 2026, days after Geofabrik moved every extract into a
+folder of its own, all but three of those requests failed. The plan of the time left those
+extracts out and baked 12 regions, and only the final check kept that from being published. The
+script now also checks before baking that the plan covers every continent the published index has.
+A run that is merely slow is another matter: Modal kills it after 24 hours, so once a tenth is
+baked it gives up as soon as its pace would leave the upload less than two hours; the November
+2026 run would have needed about 36.
 
 One-time setup:
 

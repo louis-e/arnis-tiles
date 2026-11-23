@@ -1,8 +1,9 @@
 //! Turns one .osm.pbf extract into per-tile payloads, written to the chunk store.
 //!
-//! Three streaming passes, so peak memory is one node-coordinate array rather than the whole
-//! extract: relations first (to learn which untagged ways are multipolygon members), then
-//! node coordinates, then ways. Nothing is held that a later pass can re-read.
+//! Two streaming passes, so peak memory is one node-coordinate array rather than the whole
+//! extract: node coordinates and relations first (the relations say which untagged ways are
+//! multipolygon members), then ways. Nothing is held that a later pass can re-read. Each pass
+//! decodes on every core; see `pass`.
 //!
 //! Finished tiles are flushed to the store as they accumulate rather than at the end. Holding a
 //! whole region's output was what made the united-kingdom extract take the process past 8 GB;
@@ -12,9 +13,10 @@ use crate::format::{self, Node, Relation, Tile, Way};
 use crate::store::{ChunkStore, RELATION_X};
 use crate::tags;
 use crate::tilemath;
-use osmpbf::{Element, ElementReader, RelMemberType};
-use std::collections::{HashMap, HashSet};
+use osmpbf::{Blob, BlobDecode, BlobReader, PrimitiveBlock, RelMemberType};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::{mpsc, Arc, Mutex};
 
 /// Degrees -> stored units, at format::COORD_SCALE.
 fn q(v: f64) -> i32 {
@@ -173,6 +175,98 @@ pub struct Stats {
     pub bytes: u64,
 }
 
+/// One pass over `pbf`: every core decodes blocks and runs `map` on them, and `consume` gets
+/// the results one block at a time in file order, so the pass does exactly what a
+/// single-threaded walk over the file would.
+///
+/// Decoding on one core held the bake to about 5 MB/s of .pbf on Modal, a tenth of what
+/// Geofabrik serves there, while the other cores waited for the next region.
+fn pass<T: Send>(
+    pbf: &Path,
+    map: impl Fn(&PrimitiveBlock) -> T + Sync,
+    mut consume: impl FnMut(T) -> Result<(), String>,
+) -> Result<(), String> {
+    let reader = BlobReader::from_path(pbf).map_err(|e| format!("{}: {e}", pbf.display()))?;
+    // Modal reports the 20 cores a container may burst to. Past 16 the serial consumer is the
+    // limit anyway, and each worker adds blocks in flight.
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(16));
+    // Blocks read but not yet consumed. A slow block holds up the ones behind it, and this
+    // bounds how many can pile up in memory meanwhile: a few MB each at most.
+    let window = workers * 2;
+    let (credit_tx, credit_rx) = mpsc::sync_channel::<()>(window);
+    for _ in 0..window {
+        credit_tx.send(()).expect("the receiver is right here");
+    }
+    let (blob_tx, blob_rx) = mpsc::sync_channel::<(usize, Blob)>(window);
+    let blob_rx = Arc::new(Mutex::new(blob_rx));
+    type Done<T> = (usize, Result<Option<T>, String>);
+    let (done_tx, done_rx) = mpsc::channel::<Done<T>>();
+    let map = &map;
+    // Returning early drops credit_tx and done_rx, which stops the reader and the workers
+    // before the scope joins them.
+    std::thread::scope(move |s| {
+        let reader_done = done_tx.clone();
+        s.spawn(move || {
+            for (seq, blob) in reader.enumerate() {
+                if credit_rx.recv().is_err() {
+                    return;
+                }
+                let sent = match blob {
+                    Ok(b) => blob_tx.send((seq, b)).is_ok(),
+                    Err(e) => {
+                        let _ = reader_done.send((seq, Err(format!("{}: {e}", pbf.display()))));
+                        false
+                    }
+                };
+                if !sent {
+                    return;
+                }
+            }
+        });
+        for _ in 0..workers {
+            let (rx, tx) = (Arc::clone(&blob_rx), done_tx.clone());
+            s.spawn(move || loop {
+                let Ok((seq, blob)) = rx.lock().expect("no worker panics").recv() else {
+                    return;
+                };
+                // A panic would leave the consumer waiting for this block forever, so it is
+                // turned into an error like any other.
+                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match blob.decode() {
+                        Ok(BlobDecode::OsmData(block)) => Ok(Some(map(&block))),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(format!("{}: {e}", pbf.display())),
+                    }
+                }))
+                .unwrap_or_else(|_| Err(format!("{}: block {seq} panicked", pbf.display())));
+                if tx.send((seq, out)).is_err() {
+                    return;
+                }
+            });
+        }
+        drop(done_tx);
+        drop(blob_rx);
+
+        let mut early: BTreeMap<usize, Result<Option<T>, String>> = BTreeMap::new();
+        let mut next = 0;
+        for (seq, out) in done_rx.iter() {
+            early.insert(seq, out);
+            while let Some(out) = early.remove(&next) {
+                next += 1;
+                if let Some(t) = out? {
+                    consume(t)?;
+                }
+                let _ = credit_tx.send(());
+            }
+        }
+        if early.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("{}: block {next} never decoded", pbf.display()))
+        }
+    })
+}
+
 /// `keep` limits the output to those tile ranges, for supplements baked for a few islands.
 pub fn bake(
     pbf: &Path,
@@ -181,39 +275,10 @@ pub fn bake(
     zoom: u8,
     keep: &[(u32, u32, u32, u32)],
 ) -> Result<Stats, String> {
-    let open = || ElementReader::from_path(pbf).map_err(|e| format!("{}: {e}", pbf.display()));
-
-    // ── pass 0: relations ────────────────────────────────────────────────────
+    // ── pass 1: node coordinates (+ the tagged ones, which are POIs in their own right), and
+    //    relations, to learn which untagged ways are multipolygon members ──
     let mut relations: Vec<Relation> = Vec::new();
     let mut member_ways: HashSet<i64> = HashSet::new();
-    open()?
-        .for_each(|el| {
-            if let Element::Relation(r) = el {
-                let t: Vec<(String, String)> = tags::filter(r.tags());
-                if !tags::relation_is_wanted(&t) {
-                    return;
-                }
-                let members: Vec<(u64, String)> = r
-                    .members()
-                    .filter(|m| m.member_type == RelMemberType::Way)
-                    .map(|m| (m.member_id as u64, m.role().unwrap_or("").to_string()))
-                    .collect();
-                if members.is_empty() {
-                    return;
-                }
-                for (id, _) in &members {
-                    member_ways.insert(*id as i64);
-                }
-                relations.push(Relation {
-                    id: r.id() as u64,
-                    tags: t,
-                    members,
-                });
-            }
-        })
-        .map_err(|e| e.to_string())?;
-
-    // ── pass 1: node coordinates (+ the tagged ones, which are POIs in their own right) ──
     let mut sink = Sink {
         tiles: HashMap::new(),
         weights: HashMap::new(),
@@ -228,42 +293,70 @@ pub fn bake(
     };
     let mut coords: Vec<(i64, i32, i32)> = Vec::new();
     let mut n_pois = 0u64;
-    let mut poi_err: Option<String> = None;
-    let mut handle_node = |id: i64, lat: f64, lon: f64, t: Vec<(String, String)>| {
-        coords.push((id, q(lat), q(lon)));
-        if poi_err.is_none() && tags::node_is_wanted(&t) {
-            n_pois += 1;
-            let node = Node {
-                id: id as u64,
-                lat: q(lat),
-                lon: q(lon),
-                tags: t,
+    pass(
+        pbf,
+        |block| {
+            let mut nodes: Vec<(i64, i32, i32)> = Vec::new();
+            let mut pois: Vec<((u32, u32), Node)> = Vec::new();
+            let mut rels: Vec<Relation> = Vec::new();
+            let mut each = |id: i64, lat: f64, lon: f64, t: Vec<(String, String)>| {
+                nodes.push((id, q(lat), q(lon)));
+                if tags::node_is_wanted(&t) {
+                    let node = Node {
+                        id: id as u64,
+                        lat: q(lat),
+                        lon: q(lon),
+                        tags: t,
+                    };
+                    pois.push((tilemath::tile_of(lat, lon, zoom), node));
+                }
             };
-            let tl = tilemath::tile_of(lat, lon, zoom);
-            let w = weigh(&node.tags, 1);
-            // osmpbf's for_each hands back no Result, so an error is parked and raised once
-            // the pass ends rather than silently dropping the rest of the nodes.
-            if let Err(e) = sink.add(tl, w, |t| t.nodes.push(node)) {
-                poi_err = Some(e);
+            // Group by group, so the ways in between are never decoded.
+            for group in block.groups() {
+                for n in group.nodes() {
+                    each(n.id(), n.lat(), n.lon(), tags::filter(n.tags()));
+                }
+                for n in group.dense_nodes() {
+                    each(n.id(), n.lat(), n.lon(), tags::filter(n.tags()));
+                }
+                for r in group.relations() {
+                    let t: Vec<(String, String)> = tags::filter(r.tags());
+                    if !tags::relation_is_wanted(&t) {
+                        continue;
+                    }
+                    let members: Vec<(u64, String)> = r
+                        .members()
+                        .filter(|m| m.member_type == RelMemberType::Way)
+                        .map(|m| (m.member_id as u64, m.role().unwrap_or("").to_string()))
+                        .collect();
+                    if members.is_empty() {
+                        continue;
+                    }
+                    rels.push(Relation {
+                        id: r.id() as u64,
+                        tags: t,
+                        members,
+                    });
+                }
             }
-        }
-    };
-    open()?
-        .for_each(|el| match el {
-            Element::Node(n) => {
-                let t = tags::filter(n.tags());
-                handle_node(n.id(), n.lat(), n.lon(), t);
+            (nodes, pois, rels)
+        },
+        |(nodes, pois, rels)| {
+            coords.extend(nodes);
+            for (tl, node) in pois {
+                n_pois += 1;
+                let w = weigh(&node.tags, 1);
+                sink.add(tl, w, |t| t.nodes.push(node))?;
             }
-            Element::DenseNode(n) => {
-                let t = tags::filter(n.tags());
-                handle_node(n.id(), n.lat(), n.lon(), t);
+            for r in rels {
+                for (id, _) in &r.members {
+                    member_ways.insert(*id as i64);
+                }
+                relations.push(r);
             }
-            _ => {}
-        })
-        .map_err(|e| e.to_string())?;
-    if let Some(e) = poi_err {
-        return Err(e);
-    }
+            Ok(())
+        },
+    )?;
     sink.flush()?;
     coords.sort_unstable_by_key(|(id, _, _)| *id);
     let lookup = |id: i64| -> Option<(i32, i32)> {
@@ -276,85 +369,87 @@ pub fn bake(
     // ── pass 2: ways, emitted straight into their tiles ──────────────────────
     let mut way_tiles: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
     let mut n_ways = 0u64;
-    let mut way_err: Option<String> = None;
 
-    open()?
-        .for_each(|el| {
-            let Element::Way(w) = el else { return };
-            let t: Vec<(String, String)> = tags::filter(w.tags());
-            let is_member = member_ways.contains(&w.id());
-            if !is_member && !tags::way_is_wanted(&t) {
-                return;
-            }
-            let refs: Vec<i64> = w.refs().collect();
-            let raw: Vec<(i32, i32)> = refs.iter().filter_map(|r| lookup(*r)).collect();
-            if raw.len() < 2 {
-                return;
-            }
-            // Quantisation can collapse neighbouring vertices; a way that is closed in OSM
-            // must still read as closed after it, so closure is recorded from the ids.
-            let closed = refs.first() == refs.last() && refs.len() > 2;
-            let mut points: Vec<(i32, i32)> = Vec::with_capacity(raw.len());
-            for p in raw {
-                if points.last() != Some(&p) {
-                    points.push(p);
+    pass(
+        pbf,
+        |block| {
+            let mut found = Vec::new();
+            let mut each = |w: osmpbf::Way| {
+                let t: Vec<(String, String)> = tags::filter(w.tags());
+                let is_member = member_ways.contains(&w.id());
+                if !is_member && !tags::way_is_wanted(&t) {
+                    return;
                 }
-            }
-            if closed && points.first() != points.last() {
-                if let Some(first) = points.first().copied() {
-                    points.push(first);
+                let refs: Vec<i64> = w.refs().collect();
+                let raw: Vec<(i32, i32)> = refs.iter().filter_map(|r| lookup(*r)).collect();
+                if raw.len() < 2 {
+                    return;
                 }
-            }
-            if points.len() < 2 {
-                return;
-            }
+                // Quantisation can collapse neighbouring vertices; a way that is closed in OSM
+                // must still read as closed after it, so closure is recorded from the ids.
+                let closed = refs.first() == refs.last() && refs.len() > 2;
+                let mut points: Vec<(i32, i32)> = Vec::with_capacity(raw.len());
+                for p in raw {
+                    if points.last() != Some(&p) {
+                        points.push(p);
+                    }
+                }
+                if closed && points.first() != points.last() {
+                    if let Some(first) = points.first().copied() {
+                        points.push(first);
+                    }
+                }
+                if points.len() < 2 {
+                    return;
+                }
 
-            let mut touched: Vec<(u32, u32)> = Vec::new();
-            for (lat, lon) in &points {
-                touched.push(tilemath::tile_of(deg(*lat), deg(*lon), zoom));
-            }
-            for pair in points.windows(2) {
-                let (a, b) = (pair[0], pair[1]);
-                tilemath::segment_tiles(
-                    (deg(a.0), deg(a.1)),
-                    (deg(b.0), deg(b.1)),
-                    zoom,
-                    &mut touched,
-                );
-            }
-            touched.sort_unstable();
-            touched.dedup();
-            if way_err.is_some() {
-                return;
-            }
-            let way = Way {
-                id: w.id() as u64,
-                closed,
-                tags: t,
-                points,
+                let mut touched: Vec<(u32, u32)> = Vec::new();
+                for (lat, lon) in &points {
+                    touched.push(tilemath::tile_of(deg(*lat), deg(*lon), zoom));
+                }
+                for pair in points.windows(2) {
+                    let (a, b) = (pair[0], pair[1]);
+                    tilemath::segment_tiles(
+                        (deg(a.0), deg(a.1)),
+                        (deg(b.0), deg(b.1)),
+                        zoom,
+                        &mut touched,
+                    );
+                }
+                touched.sort_unstable();
+                touched.dedup();
+                let way = Way {
+                    id: w.id() as u64,
+                    closed,
+                    tags: t,
+                    points,
+                };
+                found.push((way, touched, is_member));
             };
-            let weight = weigh(&way.tags, way.points.len());
-            for tl in &touched {
-                let copy = way.clone();
-                if let Err(e) = sink.add(*tl, weight, |t| t.ways.push(copy)) {
-                    way_err = Some(e);
-                    return;
+            // Group by group, so the nodes and relations are never decoded.
+            for group in block.groups() {
+                for w in group.ways() {
+                    each(w);
                 }
             }
-            if is_member {
-                if let Err(e) = sink.member(&way) {
-                    way_err = Some(e);
-                    return;
+            found
+        },
+        |found| {
+            for (way, touched, is_member) in found {
+                let weight = weigh(&way.tags, way.points.len());
+                for tl in &touched {
+                    let copy = way.clone();
+                    sink.add(*tl, weight, |t| t.ways.push(copy))?;
                 }
-                way_tiles.insert(way.id, touched);
+                if is_member {
+                    sink.member(&way)?;
+                    way_tiles.insert(way.id, touched);
+                }
+                n_ways += 1;
             }
-            n_ways += 1;
-        })
-        .map_err(|e| e.to_string())?;
-
-    if let Some(e) = way_err {
-        return Err(e);
-    }
+            Ok(())
+        },
+    )?;
     // The coordinate table is the biggest thing here and nothing below needs it.
     drop(coords);
 
