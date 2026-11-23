@@ -62,6 +62,17 @@ def bake() -> None:
     bake_and_publish(DEADLINE=str(int(time.time()) + TIMEOUT))
 
 
+# One-off: the 23 November 2026 run failed (Geofabrik had moved its files), and a rerun that
+# afternoon met 0.8 MB/s downloads, so the bake runs again in the quiet of the next night. The
+# schedule comes round every 24 November, but does nothing after 2026; delete this once it ran.
+@app.function(schedule=modal.Cron("40 3 24 11 *", timezone="Europe/Berlin"), timeout=5 * 60)
+def rerun_on_24_november_2026() -> None:
+    import datetime
+
+    if datetime.date.today().year == 2026:
+        bake.spawn()
+
+
 @app.function(timeout=60 * 60, cpu=1.0, memory=4 * 1024, secrets=secrets)
 def smoke() -> None:
     bake_and_publish(SMOKE="1")
