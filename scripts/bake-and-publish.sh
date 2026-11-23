@@ -83,17 +83,28 @@ until tiles plan; do
     sleep "$wait"
     wait=$((wait * 2 > 3600 ? 3600 : wait * 2))
 done
+# Published continents missing from the JSON array of names in $1. Overlays are left out because a
+# full bake plans their regions itself.
+lacking() {
+    jq -rn --slurpfile p "$PREVIOUS" --argjson have "$1" \
+        '($p[0].archives | map(.name) | map(select(startswith("overlay") | not))) - $have | join(" ")'
+}
+# The check after the bake would refuse the same index, but only after hours of baking the rest.
+if [ -z "$SMOKE" ]; then
+    missing=$(lacking "$(jq -c '[.regions[].continent] | unique' "$WORK/plan.json")")
+    if [ -n "$missing" ]; then
+        echo "the plan has no region in: $missing" >&2
+        exit 1
+    fi
+fi
 log "run"
 tiles run ${RUN[@]+"${RUN[@]}"}
 tiles finalize
 INDEX="$OUT/archives.json"
 
-# Refuse an index that would serve less than the one it replaces. Overlays are left out of the
-# continent check because a full bake plans their regions itself.
+# Refuse an index that would serve less than the one it replaces.
 if [ -z "$SMOKE" ]; then
-    missing=$(jq -rn --slurpfile p "$PREVIOUS" --slurpfile n "$INDEX" \
-        '($p[0].archives | map(.name) | map(select(startswith("overlay") | not)))
-         - ($n[0].archives | map(.name)) | join(" ")')
+    missing=$(lacking "$(jq -c '[.archives[].name]' "$INDEX")")
     if [ -n "$missing" ]; then
         echo "the new index has no archive for: $missing" >&2
         exit 1

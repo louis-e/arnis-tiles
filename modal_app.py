@@ -38,9 +38,11 @@ def bake_and_publish(**env: str) -> None:
     )
 
 
-# Baking is one core plus a download thread and peaks near 5 GB, but writing each continent's
-# archive runs on every core there is: on one core, Europe's and North America's took ten of the
-# first run's thirteen hours, and on these four (bursting to twenty) eleven minutes.
+# Four cores are reserved, and Modal lets the container burst to twenty. Baking decodes each
+# extract on up to sixteen of them and peaks near 5.5 GB, mostly the largest extract's node
+# coordinates. Writing each continent's archive runs on every core there is: on one core,
+# Europe's and North America's took ten of the first run's thirteen hours, and here eleven
+# minutes.
 # Non-preemptible costs three times as much, but a preempted container restarts the whole planet
 # from nothing.
 #

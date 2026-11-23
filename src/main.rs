@@ -420,8 +420,9 @@ fn real_main() -> Result<(), String> {
                 }
                 left -= r.bytes;
 
-                // Downloads set the pace: on 1 November 2026 Geofabrik served 0.65 MB/s against
-                // over 4 a week earlier, which would have run 12 hours past Modal's timeout.
+                // Downloads usually outpace the bake, but not always: on 1 November 2026
+                // Geofabrik served 0.65 MB/s against over 4 a week earlier, which would have run
+                // 12 hours past Modal's timeout.
                 if let Some(deadline) = finish_by {
                     if !already && left > 0 && baked * 10 >= baked + left {
                         let now = std::time::SystemTime::now()
