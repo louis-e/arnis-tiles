@@ -16,6 +16,7 @@ use crate::tilemath;
 use osmpbf::{Blob, BlobDecode, BlobReader, PrimitiveBlock, RelMemberType};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 /// Degrees -> stored units, at format::COORD_SCALE.
@@ -186,35 +187,60 @@ fn pass<T: Send>(
     map: impl Fn(&PrimitiveBlock) -> T + Sync,
     mut consume: impl FnMut(T) -> Result<(), String>,
 ) -> Result<(), String> {
-    let reader = BlobReader::from_path(pbf).map_err(|e| format!("{}: {e}", pbf.display()))?;
+    let at = |e: &dyn std::fmt::Display| format!("{}: {e}", pbf.display());
+    let reader = BlobReader::from_path(pbf).map_err(|e| at(&e))?;
     // Modal reports the 20 cores a container may burst to. Past 16 the serial consumer is the
     // limit anyway, and each worker adds blocks in flight.
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(16));
-    // Blocks read but not yet consumed. A slow block holds up the ones behind it, and this
-    // bounds how many can pile up in memory meanwhile: a few MB each at most.
+    in_order(
+        reader.map(|blob| blob.map_err(|e| at(&e))),
+        workers,
+        |blob: Blob| match blob.decode() {
+            Ok(BlobDecode::OsmData(block)) => Ok(Some(map(&block))),
+            Ok(_) => Ok(None),
+            Err(e) => Err(at(&e)),
+        },
+        |out| out.map_or(Ok(()), &mut consume),
+    )
+}
+
+/// Runs `work` on each of `items` on `workers` threads, and hands the results to `consume` in
+/// the order of `items`, as a plain loop over them would. Stops at the first error, whether it
+/// comes from `items`, `work` (a panic included) or `consume`, and returns it once every thread
+/// has finished.
+fn in_order<I: Send, R: Send>(
+    items: impl Iterator<Item = Result<I, String>> + Send,
+    workers: usize,
+    work: impl Fn(I) -> Result<R, String> + Sync,
+    mut consume: impl FnMut(R) -> Result<(), String>,
+) -> Result<(), String> {
+    let workers = workers.max(1);
+    // Items handed out but not yet consumed. A slow one holds up those behind it, and this
+    // bounds how many can pile up in memory meanwhile: for the bake, a few MB each at most.
     let window = workers * 2;
     let (credit_tx, credit_rx) = mpsc::sync_channel::<()>(window);
     for _ in 0..window {
         credit_tx.send(()).expect("the receiver is right here");
     }
-    let (blob_tx, blob_rx) = mpsc::sync_channel::<(usize, Blob)>(window);
-    let blob_rx = Arc::new(Mutex::new(blob_rx));
-    type Done<T> = (usize, Result<Option<T>, String>);
-    let (done_tx, done_rx) = mpsc::channel::<Done<T>>();
-    let map = &map;
-    // Returning early drops credit_tx and done_rx, which stops the reader and the workers
-    // before the scope joins them.
+    let (item_tx, item_rx) = mpsc::sync_channel::<(usize, I)>(window);
+    let item_rx = Arc::new(Mutex::new(item_rx));
+    type Done<R> = (usize, Result<R, String>);
+    let (done_tx, done_rx) = mpsc::channel::<Done<R>>();
+    // Set on the first error, so the reader and the workers stop at their next item instead of
+    // working through what is already in flight.
+    let stop = AtomicBool::new(false);
+    let (work, stop) = (&work, &stop);
     std::thread::scope(move |s| {
         let reader_done = done_tx.clone();
         s.spawn(move || {
-            for (seq, blob) in reader.enumerate() {
-                if credit_rx.recv().is_err() {
+            for (seq, item) in items.enumerate() {
+                if credit_rx.recv().is_err() || stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let sent = match blob {
-                    Ok(b) => blob_tx.send((seq, b)).is_ok(),
+                let sent = match item {
+                    Ok(i) => item_tx.send((seq, i)).is_ok(),
                     Err(e) => {
-                        let _ = reader_done.send((seq, Err(format!("{}: {e}", pbf.display()))));
+                        let _ = reader_done.send((seq, Err(e)));
                         false
                     }
                 };
@@ -224,46 +250,52 @@ fn pass<T: Send>(
             }
         });
         for _ in 0..workers {
-            let (rx, tx) = (Arc::clone(&blob_rx), done_tx.clone());
+            let (rx, tx) = (Arc::clone(&item_rx), done_tx.clone());
             s.spawn(move || loop {
-                let Ok((seq, blob)) = rx.lock().expect("no worker panics").recv() else {
+                let Ok((seq, item)) = rx.lock().expect("no worker panics").recv() else {
                     return;
                 };
-                // A panic would leave the consumer waiting for this block forever, so it is
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                // A panic would leave the consumer waiting for this item forever, so it is
                 // turned into an error like any other.
-                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    match blob.decode() {
-                        Ok(BlobDecode::OsmData(block)) => Ok(Some(map(&block))),
-                        Ok(_) => Ok(None),
-                        Err(e) => Err(format!("{}: {e}", pbf.display())),
-                    }
-                }))
-                .unwrap_or_else(|_| Err(format!("{}: block {seq} panicked", pbf.display())));
+                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(item)))
+                    .unwrap_or_else(|_| Err(format!("worker panicked on item {seq}")));
                 if tx.send((seq, out)).is_err() {
                     return;
                 }
             });
         }
         drop(done_tx);
-        drop(blob_rx);
+        drop(item_rx);
 
-        let mut early: BTreeMap<usize, Result<Option<T>, String>> = BTreeMap::new();
+        let mut early: BTreeMap<usize, Result<R, String>> = BTreeMap::new();
         let mut next = 0;
-        for (seq, out) in done_rx.iter() {
-            early.insert(seq, out);
-            while let Some(out) = early.remove(&next) {
-                next += 1;
-                if let Some(t) = out? {
-                    consume(t)?;
+        let mut run = || -> Result<(), String> {
+            for (seq, out) in done_rx.iter() {
+                early.insert(seq, out);
+                while let Some(out) = early.remove(&next) {
+                    next += 1;
+                    consume(out?)?;
+                    let _ = credit_tx.send(());
                 }
-                let _ = credit_tx.send(());
             }
+            // Only a worker that died without a word could leave a gap, but a gap must never
+            // pass for the end.
+            if early.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("item {next} never finished"))
+            }
+        };
+        let result = run();
+        if result.is_err() {
+            stop.store(true, Ordering::Relaxed);
         }
-        if early.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("{}: block {next} never decoded", pbf.display()))
-        }
+        // Returning drops credit_tx and done_rx, which ends the reader and any worker still
+        // waiting, so the scope can join them.
+        result
     })
 }
 
@@ -311,7 +343,8 @@ pub fn bake(
                     pois.push((tilemath::tile_of(lat, lon, zoom), node));
                 }
             };
-            // Group by group, so the ways in between are never decoded.
+            // Group by group, so the ways are skipped rather than walked. Their blobs are still
+            // inflated: decode() unpacks a whole block.
             for group in block.groups() {
                 for n in group.nodes() {
                     each(n.id(), n.lat(), n.lon(), tags::filter(n.tags()));
@@ -426,7 +459,8 @@ pub fn bake(
                 };
                 found.push((way, touched, is_member));
             };
-            // Group by group, so the nodes and relations are never decoded.
+            // Group by group, so the nodes and relations are skipped rather than walked, which
+            // spares delta-decoding every dense node again.
             for group in block.groups() {
                 for w in group.ways() {
                     each(w);
@@ -519,4 +553,103 @@ pub fn bake(
         tiles: sink.rows,
         bytes: sink.bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_order;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Work that takes longer for some items than others, so they finish out of order.
+    fn uneven(i: usize) -> Result<usize, String> {
+        std::thread::sleep(std::time::Duration::from_micros(
+            ((i * 7919) % 13) as u64 * 50,
+        ));
+        Ok(i * 3)
+    }
+
+    #[test]
+    fn results_arrive_in_item_order() {
+        for workers in [1, 2, 8, 16] {
+            let mut seen = Vec::new();
+            in_order((0..2000).map(Ok), workers, uneven, |r| {
+                seen.push(r);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, (0..2000).map(|i| i * 3).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn a_bad_item_ends_the_pass_after_those_before_it() {
+        let items = (0..500).map(|i| {
+            if i == 300 {
+                Err(format!("bad {i}"))
+            } else {
+                Ok(i)
+            }
+        });
+        let mut seen = Vec::new();
+        let r = in_order(items, 8, uneven, |r| {
+            seen.push(r);
+            Ok(())
+        });
+        assert_eq!(r, Err("bad 300".to_string()));
+        assert_eq!(seen, (0..300).map(|i| i * 3).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn failing_work_ends_the_pass_after_those_before_it() {
+        let work = |i: usize| {
+            if i == 77 {
+                Err("no".to_string())
+            } else {
+                uneven(i)
+            }
+        };
+        let mut seen = Vec::new();
+        let r = in_order((0..500).map(Ok), 8, work, |r| {
+            seen.push(r);
+            Ok(())
+        });
+        assert_eq!(r, Err("no".to_string()));
+        assert_eq!(seen, (0..77).map(|i| i * 3).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_panic_is_an_error_not_a_hang() {
+        let work = |i: usize| -> Result<usize, String> {
+            if i == 5 {
+                panic!("on purpose");
+            }
+            Ok(i)
+        };
+        let mut seen = Vec::new();
+        let r = in_order((0..100).map(Ok), 4, work, |r| {
+            seen.push(r);
+            Ok(())
+        });
+        assert_eq!(r, Err("worker panicked on item 5".to_string()));
+        assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_failing_consumer_stops_the_reading() {
+        let read = AtomicUsize::new(0);
+        let items = (0..100_000).map(|i| {
+            read.fetch_add(1, Ordering::Relaxed);
+            Ok(i)
+        });
+        let r = in_order(items, 8, uneven, |r| {
+            if r == 30 {
+                Err("full".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(r, Err("full".to_string()));
+        // Item 10 failed; at most a window of items (16) was read past it.
+        assert!(read.load(Ordering::Relaxed) <= 10 + 1 + 16 + 1);
+    }
 }

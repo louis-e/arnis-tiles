@@ -258,10 +258,10 @@ published tiles.
 Each run gets a fresh container with an empty disk, which is all a full re-bake needs, and is
 billed only while it runs: four cores and 16 GiB, non-preemptible. Modal lets the container use up
 to 16 more cores while they are free, and bills only what is used. Since November 2026 the bake
-decodes each extract on up to 16 cores. Until then it decoded on one, at about 5 MB/s of `.pbf`, a
-tenth of what Geofabrik serves there, and that pace set the length of the run. The first complete
-run took 5 h 44 min and cost $9.76, of which $3.80 was Modal's egress charge for the ~105 GB upload
-to R2; the Starter plan's monthly credits cover it.
+decodes each extract on up to 16 cores. Until then it decoded on one, at about 5 MB/s of `.pbf`;
+on 23 November 2026 Geofabrik served Modal about 50 MB/s, though as little as 0.65 MB/s on the 1st.
+The first complete run took 5 h 44 min and cost $9.76, of which $3.80 was Modal's egress charge
+for the ~105 GB upload to R2; the Starter plan's monthly credits cover it.
 
 Downloads and the plan are retried for up to ten hours, so an outage at Geofabrik or
 openstreetmap.fr delays a run instead of failing it. An extract the plan cannot get a size for
